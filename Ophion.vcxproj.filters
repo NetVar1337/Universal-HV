@@ -61,6 +61,12 @@
     <ClCompile Include="src\svm.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\vmexit_common.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\logbuf.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
 
   <ItemGroup>
@@ -89,6 +95,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\hv_backend.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="include\hv_ioctl.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

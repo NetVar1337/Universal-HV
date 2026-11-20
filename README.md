@@ -22,30 +22,37 @@ vendor (`src/cpuinfo.c`, `include/hv_backend.h`).
 This project is under active development and has only been exercised on the
 hardware and Windows configuration listed below. It is not production-ready;
 correctness, stability, and compatibility on other systems are not guaranteed.
-The [compatibility table](#compatibility) above describes the design targets.
+The [compatibility table](#compatibility) below describes the design targets.
 
 ## Technical overview
 
 - **Dual backend:** Intel VT-x (VMX) and AMD-V (SVM) backends behind a common
   `HV_BACKEND` vtable, selected at load time from the CPU vendor. Both
   virtualize every logical processor in every processor group.
-- **Per-processor virtualization:** Uses a group-aware DPC broadcast to
-  initialize and terminate virtualization on all logical processors, including
-  multi-group machines with more than 64 logical processors.
-- **EPT / NPT:** Builds a dynamic identity map (2 MB pages, split on MTRR/RAM
-  boundaries) from the machine's actual RAM ranges, so systems with more than
-  512 GB of RAM and LA57 systems are covered. Memory types derive from MTRRs;
-  non-RAM regions are uncacheable. The same table serves as AMD NPT.
-- **VMX lifecycle:** Allocates and configures VMXON regions and VMCS state,
-  launches guests, and restores guest state during teardown.
-- **SVM lifecycle:** Allocates VMCB + host save area + IOPM/MSRPM per logical
-  processor, programs intercepts, and runs VMRUN; #VMEXIT is dispatched by
-  `svm_exit_handler`.
-- **VM-exit / #VMEXIT handling:** Handlers for selected CPUID,
-  control-register, debug-register, MSR, EPT/NPT, interrupt, and exception
-  events on both backends.
-- **Host-state isolation:** Includes private host page tables, an IDT, and
-  per-processor GDTs for VMX-root / SVM host operation.
+- **Per-processor virtualization:** Uses documented Windows 7+ group-affinity
+  enumeration (`KeGetProcessorNumberFromIndex` + `KeSetSystemGroupAffinityThread`)
+  to initialize and terminate virtualization on every logical processor across
+  all processor groups, with S3/S4 power-state (`\Callback\PowerState`) and CPU
+  hot-add (`KeRegisterProcessorChangeCallback`) support.
+- **EPT / NPT:** Builds a dynamic identity map (1 GB huge pages where supported,
+  2 MB large pages, split to 4 KB on MTRR/RAM boundaries) using true Intel EPT
+  format on Intel and true x86-64 NPT format (with `IA32_PAT`-derived caching)
+  on AMD. Unmapped above-4G MMIO (64-bit PCIe / Resizable BARs) is lazily mapped
+  as UC from a pre-allocated root-mode pool, and 4 KB EPT/NPT watchpoints are
+  supported on both backends.
+- **VMX lifecycle:** Allocates and configures VMXON regions, VMCS state, and
+  XSS-exiting bitmaps, enables per-LP `IA32_FEATURE_CONTROL`, launches guests,
+  and cleanly restores live guest state during teardown.
+- **SVM lifecycle:** Runs an AMD APM-compliant `VMLOAD`/`VMRUN`/`VMSAVE` host
+  loop with per-LP VMCB, host VMCB, HSAVE, IOPM, and programmed MSRPM; exits
+  SVM cleanly on unload so all structures can be freed safely.
+- **VM-exit / #VMEXIT handling:** Shared backend-neutral exit policy
+  (`vmexit_common.c`), per-vCPU cycle profiler, dynamic MSR tracing, and a
+  lock-free root-mode ring-buffer logger (`logbuf.c`) with zero Windows API
+  calls in root/host mode.
+- **Host-state isolation:** Minimal private host page tables (4-level and LA57
+  5-level), per-core 32 KB-aligned VMM stacks with per-core host NMI tracking,
+  diagnostic host fault capture (`HOST_FAULT_INFO`), and per-core private GDTs.
 - **Capability-aware controls:** All VMX control bits are adjusted against the
   CPU's capability MSRs; VPID/EPT/secondary-controls use is verified at
   runtime and dependent paths (e.g. INVVPID) are guarded. Machines without
@@ -84,7 +91,12 @@ third-party product.
 | `src/util.c`, `src/globals.c` | Shared utilities and global state |
 | `asm/` | x64 MASM routines for VMX/SVM operations, context handling, and segments |
 | `include/hv_backend.h` | Backend abstraction (VMX vs SVM vtable) |
-| `include/svm.h` | AMD SVM VMCB layout, exit codes, and intercept definitions |
+| `include/hv_ioctl.h` | Shared kernel/usermode IOCTL codes and diagnostics structs |
+| `include/svm.h` | AMD SVM VMCB layout, compressed segment attributes, MSRPM helpers |
+| `src/vmexit_common.c` | Shared VMX/SVM exit policy (CPUID, XSETBV, VMCALL auth, CR checks, MSR tracing) |
+| `src/logbuf.c` | Lock-free root-mode ring-buffer event logger |
+| `tools/ophion-cli/ophion_cli.c` | Usermode CLI for status, exit profiler stats, log draining, watchpoints, and MSR tracing |
+| `tests/unit_tests.c` | Host-side unit test suite verifying MTRR, XCR0, CR, CPUID, SVM, and ring-buffer logic |
 
 ## Compatibility
 

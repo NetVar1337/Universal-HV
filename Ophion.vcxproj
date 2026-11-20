@@ -46,8 +46,8 @@
     <IntDir>$(ProjectDir)build\obj\$(Configuration)\</IntDir>
     <TargetName>Ophion</TargetName>
     <TargetExt>.sys</TargetExt>
-    <SignMode>TestSign</SignMode>
-    <TestCertificate>26F9E348962C59621D11296D690DD6D13E6B93DB</TestCertificate>
+    <SignMode Condition="'$(TestCertificate)'!=''">TestSign</SignMode>
+    <SignMode Condition="'$(TestCertificate)'==''">Off</SignMode>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <DriverSign>
@@ -65,7 +65,7 @@
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <WholeProgramOptimization>true</WholeProgramOptimization>
-      <TreatWarningAsError>false</TreatWarningAsError>
+      <TreatWarningAsError>true</TreatWarningAsError>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <AdditionalOptions>/FS %(AdditionalOptions)</AdditionalOptions>
@@ -87,7 +87,7 @@
       <AdditionalIncludeDirectories>$(ProjectDir)include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level4</WarningLevel>
       <Optimization>Disabled</Optimization>
-      <TreatWarningAsError>false</TreatWarningAsError>
+      <TreatWarningAsError>true</TreatWarningAsError>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <AdditionalOptions>/FS %(AdditionalOptions)</AdditionalOptions>
@@ -117,6 +117,8 @@
     <ClCompile Include="src\win_compat.c" />
     <ClCompile Include="src\cpuinfo.c" />
     <ClCompile Include="src\svm.c" />
+    <ClCompile Include="src\vmexit_common.c" />
+    <ClCompile Include="src\logbuf.c" />
   </ItemGroup>
   <!-- Assembly Files (MASM x64) -->
   <ItemGroup>
@@ -140,6 +142,7 @@
     <ClInclude Include="include\cpuinfo.h" />
     <ClInclude Include="include\svm.h" />
     <ClInclude Include="include\hv_backend.h" />
+    <ClInclude Include="include\hv_ioctl.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

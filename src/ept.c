@@ -88,6 +88,27 @@ ept_make_nonleaf(UINT64 next_pa)
 }
 
 static __forceinline UINT64
+ept_make_leaf_1gb(SIZE_T pfn1gb, UINT8 mem_type)
+{
+    if (g_ept->is_npt)
+    {
+        return NPT_PTE_PRESENT | NPT_PTE_WRITE | NPT_PTE_USER | NPT_PTE_LARGE_PAGE |
+               (((UINT64)pfn1gb) << 30) | npt_pat_bits(mem_type, TRUE);
+    }
+    else
+    {
+        EPT_PML3_ENTRY e = {0};
+        e.ReadAccess      = 1;
+        e.WriteAccess     = 1;
+        e.ExecuteAccess   = 1;
+        e.LargePage       = 1;
+        e.MemoryType      = mem_type;
+        e.PageFrameNumber = (UINT64)pfn1gb;
+        return e.AsUInt;
+    }
+}
+
+static __forceinline UINT64
 ept_make_leaf_2mb(SIZE_T pfn2mb, UINT8 mem_type)
 {
     if (g_ept->is_npt)
@@ -196,7 +217,8 @@ ept_check_features(VOID)
             return FALSE;
         }
 
-        g_ept->ad_supported = vpid_reg.EptAccessedAndDirtyFlags ? TRUE : FALSE;
+        g_ept->ad_supported       = vpid_reg.EptAccessedAndDirtyFlags ? TRUE : FALSE;
+        g_ept->huge_1gb_supported = vpid_reg.Pdpte1GbPages ? TRUE : FALSE;
 
         g_ept->invvpid_supported                = vpid_reg.Invvpid ? TRUE : FALSE;
         g_ept->invvpid_individual_addr          = vpid_reg.InvvpidIndividualAddress ? TRUE : FALSE;
@@ -238,6 +260,15 @@ ept_check_features(VOID)
         {
             HV_LOG("NPT: nested paging not supported on this CPU\n");
             return FALSE;
+        }
+        //
+        // Check 1GB page support via CPUID.80000001:EDX[26] (Page1GB)
+        //
+        if (g_cpu.max_ext_leaf >= CPUID_EXT_FEATURES)
+        {
+            INT32 regs[4] = {0};
+            __cpuid(regs, CPUID_EXT_FEATURES);
+            g_ept->huge_1gb_supported = ((UINT32)regs[3] & (1U << 26)) ? TRUE : FALSE;
         }
         ept_init_npt_pat_map();
     }
@@ -484,6 +515,35 @@ ept_valid_for_large_page(SIZE_T pfn2mb)
     return TRUE;
 }
 
+BOOLEAN
+ept_valid_for_1gb_page(SIZE_T pfn1gb)
+{
+    UINT64 start_addr = (UINT64)pfn1gb * SIZE_1_GB;
+    UINT64 end_addr   = start_addr + SIZE_1_GB - 1ULL;
+
+    for (UINT32 i = 0; i < g_ept->num_ranges; i++)
+    {
+        MTRR_RANGE_DESCRIPTOR * range = &g_ept->mem_ranges[i];
+        if ((start_addr <= range->phys_end && end_addr > range->phys_end) ||
+            (start_addr < range->phys_base && end_addr >= range->phys_base))
+        {
+            return FALSE;
+        }
+    }
+
+    for (UINT32 i = 0; i < g_ept->num_ram_ranges; i++)
+    {
+        RAM_RANGE * ram = &g_ept->ram_ranges[i];
+        if ((start_addr <= ram->end && end_addr > ram->end) ||
+            (start_addr < ram->base && end_addr >= ram->base))
+        {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
 static PVOID
 ept_alloc_table(PVMM_EPT_PAGE_TABLE table, UINT64 *pa_out)
 {
@@ -594,6 +654,26 @@ ept_map_2mb(PVMM_EPT_PAGE_TABLE table, UINT64 addr2mb)
 }
 
 static BOOLEAN
+ept_map_1gb(PVMM_EPT_PAGE_TABLE table, UINT64 addr1gb)
+{
+    UINT32 pml4_idx = (UINT32)(addr1gb >> 39) & 0x1FFU;
+    UINT32 pml3_idx = (UINT32)(addr1gb >> 30) & 0x1FFU;
+
+    PVOID pml3 = ept_ensure_pml3(table, pml4_idx);
+    if (!pml3)
+        return FALSE;
+
+    PUINT64 pml3e = &((PUINT64)pml3)[pml3_idx];
+    if (ept_entry_is_present(*pml3e))
+        return TRUE;
+
+    SIZE_T pfn1gb = (SIZE_T)(addr1gb / SIZE_1_GB);
+    UINT8  mt     = ept_get_memory_type(pfn1gb * 512, TRUE);
+    *pml3e = ept_make_leaf_1gb(pfn1gb, mt);
+    return TRUE;
+}
+
+static BOOLEAN
 ept_map_range(PVMM_EPT_PAGE_TABLE table, UINT64 base, UINT64 end)
 {
     if (base >= EPT_MAX_PHYS_SUPPORTED)
@@ -606,12 +686,39 @@ ept_map_range(PVMM_EPT_PAGE_TABLE table, UINT64 base, UINT64 end)
     }
 
     UINT64 addr = base & ~(SIZE_2_MB - 1ULL);
-    for (; addr <= end; addr += SIZE_2_MB)
+    while (addr <= end)
     {
+        //
+        // use 1GB huge pages whenever supported, aligned, and uniform across
+        // MTRR and RAM boundaries (reduces EPT/NPT memory & TLB pressure).
+        //
+        if (g_ept->huge_1gb_supported &&
+            (addr & (SIZE_1_GB - 1ULL)) == 0 &&
+            (addr + SIZE_1_GB - 1ULL) <= end &&
+            ept_valid_for_1gb_page((SIZE_T)(addr / SIZE_1_GB)))
+        {
+            UINT32 pml4_idx = (UINT32)(addr >> 39) & 0x1FFU;
+            UINT32 pml3_idx = (UINT32)(addr >> 30) & 0x1FFU;
+            PVOID  pml3     = table->PML3[pml4_idx];
+            BOOLEAN already_split = (pml3 && ept_entry_is_present(((PUINT64)pml3)[pml3_idx]) &&
+                                     !ept_entry_is_large(((PUINT64)pml3)[pml3_idx]));
+
+            if (!already_split)
+            {
+                if (!ept_map_1gb(table, addr))
+                    return FALSE;
+                if (addr > EPT_MAX_PHYS_SUPPORTED - SIZE_1_GB)
+                    break;
+                addr += SIZE_1_GB;
+                continue;
+            }
+        }
+
         if (!ept_map_2mb(table, addr))
             return FALSE;
         if (addr > EPT_MAX_PHYS_SUPPORTED - SIZE_2_MB)
             break;
+        addr += SIZE_2_MB;
     }
     return TRUE;
 }
@@ -771,6 +878,11 @@ ept_handle_dynamic_mmio(UINT64 gpa)
                 *pml3e = ept_make_nonleaf(pg->Pa);
             }
         }
+        else if (ept_entry_is_large(*pml3e))
+        {
+            // already mapped by a 1GB huge page
+            mapped = TRUE;
+        }
         else
         {
             pml2 = ept_tracked_pa_to_va(table, ept_entry_next_pa(*pml3e));
@@ -862,7 +974,7 @@ ept_init(VOID)
 
     UINT64 pml4_pa = g_ept->page_table->PML4_Pa;
 
-    for (UINT32 i = 0; i < g_cpu_count; i++)
+    for (UINT32 i = 0; i < g_vcpu_capacity; i++)
     {
         EPT_POINTER eptp = {0};
         eptp.MemoryType                = MEMORY_TYPE_WRITE_BACK;
@@ -940,7 +1052,7 @@ ept_get_pml2(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
         return NULL;
 
     UINT64 pml3e = ((PUINT64)pml3)[pml3_idx];
-    if (!ept_entry_is_present(pml3e))
+    if (!ept_entry_is_present(pml3e) || ept_entry_is_large(pml3e))
         return NULL;
 
     PVOID pml2 = ept_tracked_pa_to_va(page_table, ept_entry_next_pa(pml3e));
@@ -962,6 +1074,255 @@ ept_get_pml1(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
         return NULL;
 
     return &((PEPT_PML1_ENTRY)pml1)[ADDRMASK_EPT_PML1_INDEX(phys_addr)];
+}
+
+static VOID
+ept_broadcast_flush_cb(ULONG cpu_index, PVOID context)
+{
+    UNREFERENCED_PARAMETER(context);
+    if (g_vcpu && cpu_index < g_vcpu_capacity && g_vcpu[cpu_index].launched)
+    {
+        if (g_hv_backend == &g_vmx_backend)
+            asm_vmx_vmcall(VMCALL_INVEPT, 0, 0, 0);
+        else if (g_hv_backend == &g_svm_backend)
+            asm_svm_vmcall(VMCALL_INVEPT, 0, 0, 0);
+    }
+}
+
+static PUINT64
+ept_ensure_4kb_pte_from_dynpool(PVMM_EPT_PAGE_TABLE table, UINT64 phys_addr)
+{
+    UINT64 page_addr = phys_addr & ~0xFFFULL;
+    UINT32 pml4_idx  = (UINT32)(page_addr >> 39) & 0x1FFU;
+    UINT32 pml3_idx  = (UINT32)(page_addr >> 30) & 0x1FFU;
+    UINT32 pml2_idx  = (UINT32)(page_addr >> 21) & 0x1FFU;
+    UINT32 pml1_idx  = (UINT32)(page_addr >> 12) & 0x1FFU;
+    PUINT64 result   = NULL;
+
+    while (_InterlockedCompareExchange(&table->DynLock, 1, 0) != 0)
+        _mm_pause();
+
+    PVOID pml3 = table->PML3[pml4_idx];
+    if (!pml3)
+        goto unlock;
+
+    PUINT64 pml3e = &((PUINT64)pml3)[pml3_idx];
+    if (!ept_entry_is_present(*pml3e))
+        goto unlock;
+
+    //
+    // if 1GB huge page, split into 512 2MB pages using a pre-mapped DynPool page
+    //
+    if (ept_entry_is_large(*pml3e))
+    {
+        if (table->DynPoolUsed >= table->DynPoolCount)
+            goto unlock;
+
+        VMM_EPT_PAGE *pg   = &table->DynPool[table->DynPoolUsed++];
+        PUINT64       pml2 = (PUINT64)pg->Va;
+        SIZE_T        base2mb = (SIZE_T)((page_addr & ~(SIZE_1_GB - 1ULL)) / SIZE_2_MB);
+
+        for (UINT32 i = 0; i < 512; i++)
+            pml2[i] = ept_make_leaf_2mb(base2mb + i, ept_get_memory_type(base2mb + i, TRUE));
+
+        *pml3e = ept_make_nonleaf(pg->Pa);
+    }
+
+    PUINT64 pml2 = (PUINT64)ept_tracked_pa_to_va(table, ept_entry_next_pa(*pml3e));
+    if (!pml2)
+        goto unlock;
+
+    PUINT64 pml2e = &pml2[pml2_idx];
+    if (!ept_entry_is_present(*pml2e))
+        goto unlock;
+
+    //
+    // if 2MB large page, split into 512 4KB pages using a pre-mapped DynPool page
+    //
+    if (ept_entry_is_large(*pml2e))
+    {
+        if (table->DynPoolUsed >= table->DynPoolCount)
+            goto unlock;
+
+        VMM_EPT_PAGE *pg   = &table->DynPool[table->DynPoolUsed++];
+        PUINT64       pml1 = (PUINT64)pg->Va;
+        SIZE_T        base4k = (SIZE_T)((page_addr & ~(SIZE_2_MB - 1ULL)) / PAGE_SIZE);
+
+        for (UINT32 i = 0; i < 512; i++)
+            pml1[i] = ept_make_leaf_4kb(base4k + i, ept_get_memory_type(base4k + i, FALSE));
+
+        *pml2e = ept_make_nonleaf(pg->Pa);
+    }
+
+    PUINT64 pml1 = (PUINT64)ept_tracked_pa_to_va(table, ept_entry_next_pa(*pml2e));
+    if (pml1)
+        result = &pml1[pml1_idx];
+
+unlock:
+    _InterlockedExchange(&table->DynLock, 0);
+    return result;
+}
+
+BOOLEAN
+ept_add_watchpoint(UINT64 phys_addr, UINT32 flags)
+{
+    if (!g_ept || !g_ept->page_table || flags == 0)
+        return FALSE;
+
+    UINT64  page = phys_addr & ~0xFFFULL;
+    PUINT64 pte  = ept_ensure_4kb_pte_from_dynpool(g_ept->page_table, page);
+    if (!pte)
+        return FALSE;
+
+    //
+    // compute restricted trap entry:
+    // Intel EPT: clear Read(bit 0), Write(bit 1), Execute(bit 2) as requested.
+    //            (note: Intel EPT forbids Write-only without Read, so trapping Read
+    //             must also clear Write to avoid EPT Misconfiguration!)
+    // AMD NPT:   Present(bit 0) clears R+W+X, Write(bit 1) traps writes, NX(bit 63) traps exec.
+    //
+    while (_InterlockedCompareExchange(&g_ept->wp_lock, 1, 0) != 0)
+        _mm_pause();
+
+    INT32 slot = -1;
+    for (UINT32 i = 0; i < HV_MAX_WATCHPOINTS; i++)
+    {
+        if (g_ept->watchpoints[i].active && g_ept->watchpoints[i].phys_page == page)
+        {
+            slot = (INT32)i;
+            break;
+        }
+        if (!g_ept->watchpoints[i].active && slot < 0)
+            slot = (INT32)i;
+    }
+
+    if (slot < 0)
+    {
+        _InterlockedExchange(&g_ept->wp_lock, 0);
+        return FALSE;
+    }
+
+    EPT_WATCHPOINT *wp = &g_ept->watchpoints[slot];
+    UINT64 orig = wp->active ? wp->orig_entry : *pte;
+    UINT64 trap = orig;
+
+    if (g_ept->is_npt)
+    {
+        if (flags & HV_WP_TRAP_READ)
+            trap &= ~NPT_PTE_PRESENT;
+        if (flags & HV_WP_TRAP_WRITE)
+            trap &= ~NPT_PTE_WRITE;
+        if (flags & HV_WP_TRAP_EXEC)
+            trap |= (1ULL << 63); // NX bit
+    }
+    else
+    {
+        if (flags & HV_WP_TRAP_READ)
+            trap &= ~3ULL;        // clear R & W (avoid write-only EPT misconfig!)
+        if (flags & HV_WP_TRAP_WRITE)
+            trap &= ~2ULL;        // clear W
+        if (flags & HV_WP_TRAP_EXEC)
+            trap &= ~4ULL;        // clear X
+    }
+
+    if (!wp->active)
+        g_ept->active_watchpoints++;
+
+    wp->active     = TRUE;
+    wp->flags      = flags;
+    wp->phys_page  = page;
+    wp->orig_entry = orig;
+    wp->trap_entry = trap;
+    wp->pte_va     = pte;
+    wp->hit_count  = 0;
+
+    *pte = trap;
+
+    _InterlockedExchange(&g_ept->wp_lock, 0);
+
+    if (g_hv_active)
+        hv_for_each_cpu(ept_broadcast_flush_cb, NULL);
+
+    return TRUE;
+}
+
+BOOLEAN
+ept_remove_watchpoint(UINT64 phys_addr)
+{
+    if (!g_ept)
+        return FALSE;
+
+    UINT64  page  = phys_addr & ~0xFFFULL;
+    BOOLEAN found = FALSE;
+
+    while (_InterlockedCompareExchange(&g_ept->wp_lock, 1, 0) != 0)
+        _mm_pause();
+
+    for (UINT32 i = 0; i < HV_MAX_WATCHPOINTS; i++)
+    {
+        EPT_WATCHPOINT *wp = &g_ept->watchpoints[i];
+        if (wp->active && wp->phys_page == page)
+        {
+            if (wp->pte_va)
+                *wp->pte_va = wp->orig_entry;
+            wp->active = FALSE;
+            wp->pte_va = NULL;
+            if (g_ept->active_watchpoints > 0)
+                g_ept->active_watchpoints--;
+            found = TRUE;
+            break;
+        }
+    }
+
+    _InterlockedExchange(&g_ept->wp_lock, 0);
+
+    if (found && g_hv_active)
+        hv_for_each_cpu(ept_broadcast_flush_cb, NULL);
+
+    return found;
+}
+
+//
+// root-mode watchpoint lookup (ZERO Windows API calls)
+//
+INT32
+ept_find_watchpoint_root(UINT64 gpa)
+{
+    if (!g_ept || g_ept->active_watchpoints == 0)
+        return -1;
+
+    UINT64 page = gpa & ~0xFFFULL;
+    for (UINT32 i = 0; i < HV_MAX_WATCHPOINTS; i++)
+    {
+        if (g_ept->watchpoints[i].active && g_ept->watchpoints[i].phys_page == page)
+            return (INT32)i;
+    }
+    return -1;
+}
+
+VOID
+ept_watchpoint_disarm_root(UINT32 idx)
+{
+    if (!g_ept || idx >= HV_MAX_WATCHPOINTS)
+        return;
+
+    EPT_WATCHPOINT *wp = &g_ept->watchpoints[idx];
+    if (wp->active && wp->pte_va)
+    {
+        *wp->pte_va = wp->orig_entry;
+        _InterlockedIncrement64(&wp->hit_count);
+    }
+}
+
+VOID
+ept_watchpoint_rearm_root(UINT32 idx)
+{
+    if (!g_ept || idx >= HV_MAX_WATCHPOINTS)
+        return;
+
+    EPT_WATCHPOINT *wp = &g_ept->watchpoints[idx];
+    if (wp->active && wp->pte_va)
+        *wp->pte_va = wp->trap_entry;
 }
 
 VOID

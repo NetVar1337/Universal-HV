@@ -190,7 +190,7 @@ hostcr3_build(VOID)
         if (!hostcr3_map_range(g_vcpu, sizeof(VIRTUAL_MACHINE_STATE) * g_vcpu_capacity, FALSE))
             goto fail;
 
-        for (UINT32 i = 0; i < g_cpu_count; i++)
+        for (UINT32 i = 0; i < g_vcpu_capacity; i++)
         {
             VIRTUAL_MACHINE_STATE *vcpu = &g_vcpu[i];
 
@@ -225,10 +225,12 @@ hostcr3_build(VOID)
     }
 
     //
-    // 3. map EPT/NPT state + page tables + DynPool (accessed during root-mode
-    //    EPT violation / NPF dynamic MMIO mapping)
+    // 3. map EPT/NPT state + page tables + DynPool + lock-free root log ring
     //
     if (!ept_map_into_hostcr3())
+        goto fail;
+
+    if (!logbuf_map_into_hostcr3())
         goto fail;
 
     HV_LOG("Minimal private host CR3 built: PA=0x%llx (%u pages, %s)\n",

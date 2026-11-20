@@ -1,17 +1,11 @@
 /*
-*   vmx.c - vmx initialization, vmcs setup, and vmx lifecycle management
-*   this is the core of the hypervisor. handles vmxon, vmcs allocation,
-*   full vmcs field programming, and vmlaunch
+*   vmx.c - Intel VT-x (VMX) initialization, VMCS setup, and lifecycle management
 */
 #include "hv.h"
 
 BOOLEAN
 vmx_check_support(VOID)
 {
-    //
-    // vendor + IA32_FEATURE_CONTROL handling already done by
-    // cpuinfo_init()/cpuinfo_vmx_enable() in DriverEntry.
-    //
     return (g_cpu.vendor == HV_VENDOR_INTEL && g_cpu.vmx_usable) ? TRUE : FALSE;
 }
 
@@ -52,9 +46,6 @@ vmx_set_fixed_bits(VOID)
     __writecr4(cr4.AsUInt);
 }
 
-/*
-*   allocate vmxon region (memory only — vmxon runs per-core later)
-*/
 BOOLEAN
 vmx_alloc_vmxon(VIRTUAL_MACHINE_STATE * vcpu)
 {
@@ -71,14 +62,14 @@ vmx_alloc_vmxon(VIRTUAL_MACHINE_STATE * vcpu)
     RtlZeroMemory(vmxon_region, 2 * VMXON_SIZE + ALIGNMENT_PAGE_SIZE);
 
     phys_addr  = va_to_pa(vmxon_region);
-    aligned_va = (UINT64)((ULONG_PTR)(vmxon_region + ALIGNMENT_PAGE_SIZE - 1) & ~(ALIGNMENT_PAGE_SIZE - 1));
-    aligned_pa = (UINT64)((ULONG_PTR)(phys_addr + ALIGNMENT_PAGE_SIZE - 1) & ~(ALIGNMENT_PAGE_SIZE - 1));
+    aligned_va = (UINT64)(((ULONG_PTR)vmxon_region + ALIGNMENT_PAGE_SIZE - 1) & ~(ULONG_PTR)(ALIGNMENT_PAGE_SIZE - 1));
+    aligned_pa = (UINT64)((phys_addr + ALIGNMENT_PAGE_SIZE - 1) & ~(UINT64)(ALIGNMENT_PAGE_SIZE - 1));
 
-    vmx_basic.AsUInt          = __readmsr(IA32_VMX_BASIC);
-    *(UINT64 *)aligned_va        = vmx_basic.VmcsRevisionId;
+    vmx_basic.AsUInt       = __readmsr(IA32_VMX_BASIC);
+    *(UINT32 *)aligned_va  = (UINT32)vmx_basic.VmcsRevisionId;
 
     vcpu->vmxon_pa = aligned_pa;
-    vcpu->vmxon_va  = (UINT64)vmxon_region;
+    vcpu->vmxon_va = (UINT64)vmxon_region;
     return TRUE;
 }
 
@@ -98,14 +89,14 @@ vmx_alloc_vmcs(VIRTUAL_MACHINE_STATE * vcpu)
     RtlZeroMemory(vmcs_region, 2 * VMCS_SIZE + ALIGNMENT_PAGE_SIZE);
 
     phys_addr  = va_to_pa(vmcs_region);
-    aligned_va = (UINT64)((ULONG_PTR)(vmcs_region + ALIGNMENT_PAGE_SIZE - 1) & ~(ALIGNMENT_PAGE_SIZE - 1));
-    aligned_pa = (UINT64)((ULONG_PTR)(phys_addr + ALIGNMENT_PAGE_SIZE - 1) & ~(ALIGNMENT_PAGE_SIZE - 1));
+    aligned_va = (UINT64)(((ULONG_PTR)vmcs_region + ALIGNMENT_PAGE_SIZE - 1) & ~(ULONG_PTR)(ALIGNMENT_PAGE_SIZE - 1));
+    aligned_pa = (UINT64)((phys_addr + ALIGNMENT_PAGE_SIZE - 1) & ~(UINT64)(ALIGNMENT_PAGE_SIZE - 1));
 
-    vmx_basic.AsUInt          = __readmsr(IA32_VMX_BASIC);
-    *(UINT64 *)aligned_va        = vmx_basic.VmcsRevisionId;
+    vmx_basic.AsUInt      = __readmsr(IA32_VMX_BASIC);
+    *(UINT32 *)aligned_va = (UINT32)vmx_basic.VmcsRevisionId;
 
     vcpu->vmcs_pa = aligned_pa;
-    vcpu->vmcs_va  = (UINT64)vmcs_region;
+    vcpu->vmcs_va = (UINT64)vmcs_region;
     return TRUE;
 }
 
@@ -124,7 +115,10 @@ BOOLEAN
 vmx_load_vmcs(VIRTUAL_MACHINE_STATE * vcpu)
 {
     if (__vmx_vmptrld(&vcpu->vmcs_pa))
+    {
+        __vmx_off();
         return FALSE;
+    }
     return TRUE;
 }
 
@@ -134,8 +128,8 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     UINT32                  pri_proc;
     UINT32                  sec_proc;
     UINT64                  gdt_base;
-    IA32_VMX_BASIC_REGISTER vmx_basic     = {0};
-    VMX_SEGMENT_SELECTOR    seg_sel = {0};
+    IA32_VMX_BASIC_REGISTER vmx_basic = {0};
+    VMX_SEGMENT_SELECTOR    seg_sel   = {0};
 
     vmx_basic.AsUInt = __readmsr(IA32_VMX_BASIC);
 
@@ -151,7 +145,6 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     __vmx_vmwrite(VMCS_HOST_TR_SELECTOR, asm_get_tr() & 0xF8);
 
     __vmx_vmwrite(VMCS_GUEST_VMCS_LINK_POINTER, ~0ULL);
-
     __vmx_vmwrite(VMCS_GUEST_DEBUGCTL, __readmsr(IA32_DEBUGCTL));
 
     __vmx_vmwrite(VMCS_CTRL_TSC_OFFSET, 0);
@@ -164,8 +157,14 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
 
     gdt_base = asm_get_gdt_base();
 
+    //
+    // save per-core original IDT/GDT/TR (Windows 10/11 maintain per-core IDTs)
+    //
+    vcpu->original_idt_base  = asm_get_idt_base();
+    vcpu->original_idt_limit = asm_get_idt_limit();
+
 #if USE_PRIVATE_HOST_GDT
-    if (!hostgdt_build_for_vcpu(vcpu))
+    if (!hostgdt_populate_for_vcpu(vcpu))
         return FALSE;
 #else
     vcpu->original_gdt_base    = gdt_base;
@@ -185,27 +184,24 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     __vmx_vmwrite(VMCS_GUEST_FS_BASE, __readmsr(IA32_FS_BASE));
     __vmx_vmwrite(VMCS_GUEST_GS_BASE, __readmsr(IA32_GS_BASE));
 
+    UINT32 pri_msr = vmx_basic.VmxControls ? IA32_VMX_TRUE_PROCBASED_CTLS : IA32_VMX_PROCBASED_CTLS;
+    {
+        MSR pri_cap = {0};
+        pri_cap.Flags = __readmsr(pri_msr);
+        vcpu->cr8_load_exiting_forced = !!(pri_cap.Fields.Low & CPU_BASED_VM_EXEC_CTRL_CR8_LOAD_EXITING);
+    }
+
     pri_proc = vmx_adjust_controls(
         CPU_BASED_VM_EXEC_CTRL_USE_TSC_OFFSETTING |
         CPU_BASED_VM_EXEC_CTRL_USE_MSR_BITMAPS |
         CPU_BASED_VM_EXEC_CTRL_USE_IO_BITMAPS |
         CPU_BASED_VM_EXEC_CTRL_ACTIVATE_SECONDARY_CONTROLS,
-        vmx_basic.VmxControls ? IA32_VMX_TRUE_PROCBASED_CTLS : IA32_VMX_PROCBASED_CTLS);
+        pri_msr);
 
     __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pri_proc);
 
     vcpu->mov_dr_exiting = !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_MOV_DR_EXITING);
-    vcpu->guest_cr8 = (UINT8)__readcr8();
-
-    DbgPrintEx(0, 0, "[hv] Primary proc controls: 0x%08X (CR3load=%d CR3store=%d INVLPG=%d HLT=%d RDTSC=%d MOVDR=%d TSCoff=%d)\n",
-             pri_proc,
-             !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_CR3_LOAD_EXITING),
-             !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_CR3_STORE_EXITING),
-             !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_INVLPG_EXITING),
-             !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_HLT_EXITING),
-             !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING),
-             !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_MOV_DR_EXITING),
-             !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_USE_TSC_OFFSETTING));
+    vcpu->guest_cr8      = (UINT8)__readcr8();
 
     sec_proc = vmx_adjust_controls(
         CPU_BASED_VM_EXEC_CTRL2_ENABLE_EPT |
@@ -213,53 +209,32 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
         CPU_BASED_VM_EXEC_CTRL2_RDTSCP |
         CPU_BASED_VM_EXEC_CTRL2_ENABLE_INVPCID |
         CPU_BASED_VM_EXEC_CTRL2_ENABLE_XSAVES |
-        CPU_BASED_VM_EXEC_CTRL2_ENABLE_USER_WAIT_PAUSE, //  does not gurantee latest versions of windows 11 support yet btw
+        CPU_BASED_VM_EXEC_CTRL2_ENABLE_USER_WAIT_PAUSE,
         IA32_VMX_PROCBASED_CTLS2);
 
-    //
-    // record whether VPID actually got enabled — INVVPID must only be
-    // executed when VPID is on (it #UDs in VMX root otherwise). on CPUs
-    // without VPID the hardware flushes TLBs on CR3 writes by itself.
-    //
     g_ept->vpid_enabled = !!(sec_proc & CPU_BASED_VM_EXEC_CTRL2_ENABLE_VPID);
 
     __vmx_vmwrite(VMCS_CTRL_SECONDARY_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, sec_proc);
+
+    //
+    // SDM 26.2.1.1: if ENABLE_XSAVES is set, XSS-exiting bitmap MUST point to
+    // a valid zeroed 4KB page (leaving it 0 points at physical address 0 / IVT!).
+    //
+    if (sec_proc & CPU_BASED_VM_EXEC_CTRL2_ENABLE_XSAVES)
+    {
+        __vmx_vmwrite(VMCS_CTRL_XSS_EXITING_BITMAP, vcpu->xss_bitmap_pa);
+    }
 
     UINT32 pin_ctrl = vmx_adjust_controls(
         PIN_BASED_VM_EXEC_CTRL_NMI_EXITING |
         PIN_BASED_VM_EXEC_CTRL_VIRTUAL_NMI,
         vmx_basic.VmxControls ? IA32_VMX_TRUE_PINBASED_CTLS : IA32_VMX_PINBASED_CTLS);
 
-    //
-    // SDM: "virtual NMIs" requires "NMI exiting" — some nested VMX
-    // implementations (Hyper-V) don't advertise NMI exiting in the
-    // capability MSR's allowed-1 set despite supporting it.
-    // Force the constraint; if truly unsupported, VMLAUNCH will fail
-    // with a clear error rather than the cryptic VirtNMI-without-NMI.
-    //
     if (pin_ctrl & PIN_BASED_VM_EXEC_CTRL_VIRTUAL_NMI)
         pin_ctrl |= PIN_BASED_VM_EXEC_CTRL_NMI_EXITING;
 
     __vmx_vmwrite(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, pin_ctrl);
 
-    DbgPrintEx(0, 0, "[hv] Pin controls: 0x%08X (ExtInt=%d NMI=%d VirtNMI=%d Preempt=%d)\n",
-             pin_ctrl,
-             !!(pin_ctrl & PIN_BASED_VM_EXEC_CTRL_EXTERNAL_INTERRUPT_EXITING),
-             !!(pin_ctrl & PIN_BASED_VM_EXEC_CTRL_NMI_EXITING),
-             !!(pin_ctrl & PIN_BASED_VM_EXEC_CTRL_VIRTUAL_NMI),
-             !!(pin_ctrl & PIN_BASED_VM_EXEC_CTRL_VMX_PREEMPTION_TIMER));
-
-    //
-    // 64-bit host, save/load debug controls
-    // SAVE_DEBUG_CONTROLS: saves DR7 + IA32_DEBUGCTL on VM-exit
-    // Required for correct guest debug register state (DR7, pending #DB)
-    //
-    //
-    // ack interrupt on exit: on vm-exit due to external interrupt, the cpu
-    // acknowledges the interrupt at the lapic and stores the vector in
-    // VMCS_VMEXIT_INTERRUPTION_INFORMATION. without this, pending interrupts
-    // cause an infinite vm-exit loop -> TDR -> black blink
-    //
     UINT32 exit_ctrl = vmx_adjust_controls(
         VM_EXIT_CTRL_HOST_ADDRESS_SPACE_SIZE |
         VM_EXIT_CTRL_SAVE_DEBUG_CONTROLS |
@@ -268,35 +243,15 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
 
     __vmx_vmwrite(VMCS_CTRL_PRIMARY_VMEXIT_CONTROLS, exit_ctrl);
 
-    DbgPrintEx(0, 0, "[hv] Exit controls: 0x%08X (AckInt=%d)\n",
-             exit_ctrl, !!(exit_ctrl & VM_EXIT_CTRL_ACK_INTERRUPT_ON_EXIT));
-
-    //
-    // IA-32e mode guest, load debug controls
-    // required so guest sees its own DR7 after VM-exit/entry cycle
-    //
     __vmx_vmwrite(VMCS_CTRL_VMENTRY_CONTROLS,
                   vmx_adjust_controls(
                       VM_ENTRY_CTRL_IA32E_MODE_GUEST |
                       VM_ENTRY_CTRL_LOAD_DEBUG_CONTROLS,
                       vmx_basic.VmxControls ? IA32_VMX_TRUE_ENTRY_CTLS : IA32_VMX_ENTRY_CTLS));
 
-    //
-    // CR0: 0 = don't cause VM-exit on CR0 modifications (pass-through)
-    //
     __vmx_vmwrite(VMCS_CTRL_CR0_GUEST_HOST_MASK, 0);
     __vmx_vmwrite(VMCS_CTRL_CR0_READ_SHADOW, 0);
 
-    //
-    // CR4: stealth mode masks bit 13 (VMXE) so guest reads see VMXE=0
-    //
-    // when bit 13 in the mask is set:
-    //   - guest reads CR4: bit 13 comes from shadow (=0) -> VMXE hidden
-    //   - guest writes CR4 with bit 13 matching shadow: no VM-exit, host bits preserved
-    //   - guest writes CR4 with bit 13 != shadow: VM-exit, we handle it
-    //
-    // defeats: hvdetecc vm.vmxe
-    //
 #if STEALTH_HIDE_CR4_VMXE
     if (g_stealth_enabled)
     {
@@ -313,31 +268,25 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     __vmx_vmwrite(VMCS_GUEST_CR0, __readcr0());
     __vmx_vmwrite(VMCS_GUEST_CR3, __readcr3());
     __vmx_vmwrite(VMCS_GUEST_CR4, __readcr4());
-    __vmx_vmwrite(VMCS_GUEST_DR7, 0x400);
+    __vmx_vmwrite(VMCS_GUEST_DR7, __readdr(7));
 
-    //
-    // must be programmed or VMLAUNCH will fail VM-entry checks.
-    //
-    __vmx_vmwrite(VMCS_GUEST_ACTIVITY_STATE, 0);          // Active
-    __vmx_vmwrite(VMCS_GUEST_INTERRUPTIBILITY_STATE, 0);  // No blocking
+    __vmx_vmwrite(VMCS_GUEST_ACTIVITY_STATE, GUEST_ACTIVITY_STATE_ACTIVE);
+    __vmx_vmwrite(VMCS_GUEST_INTERRUPTIBILITY_STATE, 0);
     __vmx_vmwrite(VMCS_GUEST_PENDING_DEBUG_EXCEPTIONS, 0);
 
     __vmx_vmwrite(VMCS_HOST_CR0, __readcr0());
     __vmx_vmwrite(VMCS_HOST_CR4, __readcr4());
 
-    //
-    // HOST_CR3 = private host page tables (immune to guest pt trashing)
-    //
 #if USE_PRIVATE_HOST_CR3
     __vmx_vmwrite(VMCS_HOST_CR3, hostcr3_get());
 #else
     __vmx_vmwrite(VMCS_HOST_CR3, get_system_cr3());
 #endif
 
-    __vmx_vmwrite(VMCS_GUEST_GDTR_BASE,  asm_get_gdt_base());
+    __vmx_vmwrite(VMCS_GUEST_GDTR_BASE,  gdt_base);
     __vmx_vmwrite(VMCS_GUEST_GDTR_LIMIT, asm_get_gdt_limit());
-    __vmx_vmwrite(VMCS_GUEST_IDTR_BASE,  asm_get_idt_base());
-    __vmx_vmwrite(VMCS_GUEST_IDTR_LIMIT, asm_get_idt_limit());
+    __vmx_vmwrite(VMCS_GUEST_IDTR_BASE,  vcpu->original_idt_base);
+    __vmx_vmwrite(VMCS_GUEST_IDTR_LIMIT, vcpu->original_idt_limit);
     __vmx_vmwrite(VMCS_GUEST_RFLAGS,     asm_get_rflags());
 
     __vmx_vmwrite(VMCS_GUEST_SYSENTER_CS,  __readmsr(IA32_SYSENTER_CS));
@@ -354,21 +303,17 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     else
 #endif
     {
-        segment_get_descriptor((PUCHAR)asm_get_gdt_base(), asm_get_tr(), &seg_sel);
+        segment_get_descriptor((PUCHAR)gdt_base, asm_get_tr(), &seg_sel);
         __vmx_vmwrite(VMCS_HOST_TR_BASE,   seg_sel.Base);
-        __vmx_vmwrite(VMCS_HOST_GDTR_BASE, asm_get_gdt_base());
+        __vmx_vmwrite(VMCS_HOST_GDTR_BASE, gdt_base);
     }
 
-    //
-    // private host IDT prevents NMI hijacking (guest corrupts OS IDT vector 2,
-    // triggers NMI while in VMX-root -> attacker code runs in ring 0)
-    //
 #if USE_PRIVATE_HOST_IDT
     if (g_host_idt.initialized)
         __vmx_vmwrite(VMCS_HOST_IDTR_BASE, hostidt_get_base());
     else
 #endif
-        __vmx_vmwrite(VMCS_HOST_IDTR_BASE, asm_get_idt_base());
+        __vmx_vmwrite(VMCS_HOST_IDTR_BASE, vcpu->original_idt_base);
 
     __vmx_vmwrite(VMCS_HOST_FS_BASE, __readmsr(IA32_FS_BASE));
     __vmx_vmwrite(VMCS_HOST_GS_BASE, __readmsr(IA32_GS_BASE));
@@ -377,240 +322,272 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     __vmx_vmwrite(VMCS_HOST_SYSENTER_EIP, __readmsr(IA32_SYSENTER_EIP));
     __vmx_vmwrite(VMCS_HOST_SYSENTER_ESP, __readmsr(IA32_SYSENTER_ESP));
 
-    __vmx_vmwrite(VMCS_CTRL_MSR_BITMAP_ADDRESS, vcpu->msr_bitmap_pa);
-
+    __vmx_vmwrite(VMCS_CTRL_MSR_BITMAP_ADDRESS,  vcpu->msr_bitmap_pa);
     __vmx_vmwrite(VMCS_CTRL_IO_BITMAP_A_ADDRESS, vcpu->io_bitmap_pa_a);
     __vmx_vmwrite(VMCS_CTRL_IO_BITMAP_B_ADDRESS, vcpu->io_bitmap_pa_b);
+    __vmx_vmwrite(VMCS_CTRL_EPT_POINTER,         vcpu->ept_pointer.AsUInt);
 
-    __vmx_vmwrite(VMCS_CTRL_EPT_POINTER, vcpu->ept_pointer.AsUInt);
+    if (g_ept->vpid_enabled)
+        __vmx_vmwrite(VIRTUAL_PROCESSOR_ID, VPID_TAG);
 
-    __vmx_vmwrite(VIRTUAL_PROCESSOR_ID, VPID_TAG);
-
-    //
-    // RSP = current stack (saved by asm_vmx_save_state)
-    // RIP = asm_vmx_restore_state (returns to caller after VMLAUNCH succeeds)
-    //
     __vmx_vmwrite(VMCS_GUEST_RSP, (UINT64)guest_stack);
     __vmx_vmwrite(VMCS_GUEST_RIP, (UINT64)asm_vmx_restore_state);
 
     //
-    // store vcpu pointer at top of VMM stack so assembly can retrieve it
-    // without calling any Windows API in VMX-root mode.
+    // VMM stack layout (32KB aligned):
+    //   [top - 0x08] = vcpu pointer
+    //   [top - 0x10] = scratch
+    //   [top - 0x18] = per-core host_nmi_pending (zeroed)
+    //   [top - 0x20] = HOST_RSP (16-byte aligned)
     //
-    // stack layout:
-    //   [vmm_stack + VMM_STACK_SIZE - 8]  = vcpu pointer
-    //   [vmm_stack + VMM_STACK_SIZE - 16] = HOST_RSP (16-byte aligned)
-    //
-    *(PVIRTUAL_MACHINE_STATE *)((UINT64)vcpu->vmm_stack + VMM_STACK_SIZE - VMM_STACK_VCPU_OFFSET) = vcpu;
+    UINT64 stack_top = vcpu->vmm_stack + VMM_STACK_SIZE;
+    *(PVIRTUAL_MACHINE_STATE *)(stack_top - VMM_STACK_VCPU_OFFSET) = vcpu;
+    *(UINT64 *)(stack_top - VMM_STACK_VMCB_OFFSET)                 = 0;
+    *(UINT64 *)(stack_top - VMM_STACK_NMI_OFFSET)                  = 0;
 
-    __vmx_vmwrite(VMCS_HOST_RSP, (UINT64)vcpu->vmm_stack + VMM_STACK_SIZE - 16);
+    __vmx_vmwrite(VMCS_HOST_RSP, stack_top - VMM_STACK_RSP_OFFSET);
     __vmx_vmwrite(VMCS_HOST_RIP, (UINT64)asm_vmexit_handler);
 
     return TRUE;
 }
 
-/*
-*   called per-core via dpc — sets up vmx, enters vmx operation, launches
-*   memory for vmxon/vmcs regions is pre-allocated in vmx_init
-*   this function runs at dispatch_level and performs the vmx instructions
-*/
 BOOLEAN
 vmx_virtualize_cpu(PVOID guest_stack)
 {
-    //
-    // system-wide logical processor index (dense across all processor
-    // groups, so multi-group machines with >64 logical processors work)
-    //
-    ULONG                   core = hv_current_processor_index();
-    VIRTUAL_MACHINE_STATE * vcpu        = &g_vcpu[core];
-    UINT64                  error_code   = 0;
+    ULONG                   core       = hv_current_processor_index();
+    VIRTUAL_MACHINE_STATE * vcpu       = NULL;
+    UINT64                  error_code = 0;
+
+    if (!g_vcpu || core >= g_vcpu_capacity)
+        return FALSE;
+
+    vcpu = &g_vcpu[core];
+    if (vcpu->launched)
+        return TRUE;
 
     vcpu->proc_index = core;
     vcpu->core_id    = core;
+    vcpu->vmxoff.executed = FALSE;
+
+    //
+    // IA32_FEATURE_CONTROL is per-logical-processor — ensure VMX outside SMX
+    // is unlocked/enabled on THIS core before VMXON.
+    //
+    if (!cpuinfo_vmx_enable_current_cpu())
+    {
+        HV_LOG("IA32_FEATURE_CONTROL forbids VMX on core %u\n", core);
+        return FALSE;
+    }
 
     asm_enable_vmx();
     vmx_set_fixed_bits();
 
     if (__vmx_on(&vcpu->vmxon_pa))
     {
-        DbgPrintEx(0, 0, "[hv] VMXON failed on core %u\n", core);
+        HV_LOG("VMXON failed on core %u\n", core);
+        __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
         return FALSE;
     }
 
     if (!vmx_clear_vmcs(vcpu))
+    {
+        __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
         return FALSE;
+    }
 
     if (!vmx_load_vmcs(vcpu))
+    {
+        __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
         return FALSE;
+    }
 
-    vmx_setup_vmcs(vcpu, guest_stack);
+    if (!vmx_setup_vmcs(vcpu, guest_stack))
+    {
+        HV_LOG("vmx_setup_vmcs failed on core %u\n", core);
+        __vmx_off();
+        __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
+        return FALSE;
+    }
 
     vcpu->launched = TRUE;
 
     __vmx_vmlaunch();
 
     //
-    // if we reach here, VMLAUNCH failed
+    // only reached if VMLAUNCH failed
     //
     vcpu->launched = FALSE;
     __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &error_code);
     __vmx_off();
+    __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
 
-    DbgPrintEx(0, 0, "[hv] VMLAUNCH failed on core %u, error: 0x%llx\n", core, error_code);
+    HV_LOG("VMLAUNCH failed on core %u, error: 0x%llx\n", core, error_code);
     return FALSE;
 }
 
+//
+// called from AsmVmexitHandler.asm (VMX-root mode — ZERO Windows APIs!).
+// if VMRESUME ever fails, record VM_INSTRUCTION_ERROR into g_host_fault_info
+// and halt cleanly rather than invoking DbgPrintEx on a private host CR3.
+//
 VOID
 vmx_vmresume(VOID)
 {
     __vmx_vmresume();
 
-    //
-    // should never reach here
-    //
     UINT64 error_code = 0;
     __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &error_code);
-    __vmx_off();
 
-    DbgPrintEx(0, 0, "[hv] VMRESUME failed! Error: 0x%llx\n", error_code);
+    if (_InterlockedCompareExchange(&g_host_fault_info.valid, 1, 0) == 0)
+    {
+        g_host_fault_info.vector     = 0xFE; // synthetic VMRESUME failure marker
+        g_host_fault_info.error_code = error_code;
+        __vmx_vmread(VMCS_GUEST_RIP, &g_host_fault_info.rip);
+        __vmx_vmread(VMCS_GUEST_RSP, &g_host_fault_info.rsp);
+        __vmx_vmread(VMCS_GUEST_RFLAGS, &g_host_fault_info.rflags);
+    }
+
+    logbuf_push_root(0, HV_LOG_EVT_VMRESUME_FAIL, error_code, 0);
+
+    _disable();
+    for (;;)
+        __halt();
+}
+
+static BOOLEAN
+vmx_alloc_vcpu_resources(VIRTUAL_MACHINE_STATE * vcpu)
+{
+    //
+    // 32KB-aligned VMM stack so the host NMI handler can locate stack top from RSP
+    //
+    vcpu->vmm_stack = (UINT64)hv_alloc_aligned_contiguous(
+        VMM_STACK_SIZE, VMM_STACK_SIZE, &vcpu->vmm_stack_raw);
+    if (!vcpu->vmm_stack)
+        return FALSE;
+    RtlZeroMemory((PVOID)vcpu->vmm_stack, VMM_STACK_SIZE);
+
+    //
+    // MSR bitmap (4KB contiguous — guaranteed page-aligned under Driver Verifier)
+    //
+    vcpu->msr_bitmap_va = (UINT64)hv_alloc_contiguous(PAGE_SIZE);
+    if (!vcpu->msr_bitmap_va)
+        return FALSE;
+    RtlZeroMemory((PVOID)vcpu->msr_bitmap_va, PAGE_SIZE);
+
+    // intercept RDMSR(0x10) IA32_TIME_STAMP_COUNTER
+    ((PUCHAR)vcpu->msr_bitmap_va)[0x10 / 8] |= (UCHAR)(1U << (0x10 % 8));
+
+    // intercept IA32_FEATURE_CONTROL read+write
+    ((PUCHAR)vcpu->msr_bitmap_va)[0x3A / 8]         |= (UCHAR)(1U << (0x3A % 8));
+    ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + 0x3A / 8] |= (UCHAR)(1U << (0x3A % 8));
+
+    // intercept VMX capability MSRs (0x480-0x493) read+write
+    for (UINT32 msr_idx = 0x480; msr_idx <= 0x493; msr_idx++)
+    {
+        ((PUCHAR)vcpu->msr_bitmap_va)[msr_idx / 8]         |= (UCHAR)(1U << (msr_idx % 8));
+        ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + msr_idx / 8] |= (UCHAR)(1U << (msr_idx % 8));
+    }
+    vcpu->msr_bitmap_pa = va_to_pa((PVOID)vcpu->msr_bitmap_va);
+
+    //
+    // I/O Bitmap A (ports 0x0000 - 0x7FFF)
+    //
+    vcpu->io_bitmap_va_a = (UINT64)hv_alloc_contiguous(PAGE_SIZE);
+    if (!vcpu->io_bitmap_va_a)
+        return FALSE;
+    RtlZeroMemory((PVOID)vcpu->io_bitmap_va_a, PAGE_SIZE);
+    vcpu->io_bitmap_pa_a = va_to_pa((PVOID)vcpu->io_bitmap_va_a);
+
+    //
+    // I/O Bitmap B (ports 0x8000 - 0xFFFF)
+    //
+    vcpu->io_bitmap_va_b = (UINT64)hv_alloc_contiguous(PAGE_SIZE);
+    if (!vcpu->io_bitmap_va_b)
+        return FALSE;
+    RtlZeroMemory((PVOID)vcpu->io_bitmap_va_b, PAGE_SIZE);
+    vcpu->io_bitmap_pa_b = va_to_pa((PVOID)vcpu->io_bitmap_va_b);
+
+    //
+    // XSS-exiting bitmap (zeroed 4KB contiguous page required for ENABLE_XSAVES)
+    //
+    vcpu->xss_bitmap_va = (UINT64)hv_alloc_contiguous(PAGE_SIZE);
+    if (!vcpu->xss_bitmap_va)
+        return FALSE;
+    RtlZeroMemory((PVOID)vcpu->xss_bitmap_va, PAGE_SIZE);
+    vcpu->xss_bitmap_pa = va_to_pa((PVOID)vcpu->xss_bitmap_va);
+
+#if USE_PRIVATE_HOST_GDT
+    //
+    // pre-allocate private host GDT BEFORE hostcr3_build() so it is mapped!
+    //
+    if (!hostgdt_alloc_for_vcpu(vcpu))
+        return FALSE;
+#endif
+
+    if (!vmx_alloc_vmxon(vcpu))
+        return FALSE;
+
+    if (!vmx_alloc_vmcs(vcpu))
+        return FALSE;
+
+    vcpu->min_exit_cycles = MAXULONG64;
+    return TRUE;
 }
 
 BOOLEAN
 vmx_init(VOID)
 {
-    //
-    // count logical processors across ALL processor groups
-    //
-    g_cpu_count = hv_total_processor_count();
-    if (!g_cpu_count)
+    g_cpu_count     = hv_total_processor_count();
+    g_vcpu_capacity = hv_max_processor_count();
+    if (!g_cpu_count || !g_vcpu_capacity)
         return FALSE;
 
-    g_vcpu = (VIRTUAL_MACHINE_STATE *)hv_pool_alloc(sizeof(VIRTUAL_MACHINE_STATE) * g_cpu_count);
-
+    g_vcpu = (VIRTUAL_MACHINE_STATE *)hv_pool_alloc(sizeof(VIRTUAL_MACHINE_STATE) * g_vcpu_capacity);
     if (!g_vcpu)
         return FALSE;
-
-    RtlZeroMemory(g_vcpu, sizeof(VIRTUAL_MACHINE_STATE) * g_cpu_count);
+    RtlZeroMemory(g_vcpu, sizeof(VIRTUAL_MACHINE_STATE) * g_vcpu_capacity);
 
     if (!vmx_check_support())
     {
-        DbgPrintEx(0, 0, "[hv] VMX not supported!\n");
+        HV_LOG("VMX not supported!\n");
         return FALSE;
     }
 
-    //
-    // initialize stealth CPUID cache — MUST be before VMXON
-    // this captures bare-metal CPUID responses for invalid leaves
-    // so we can return consistent values when virtualizing.
-    //
+    if (!logbuf_init())
+        return FALSE;
+
 #if STEALTH_CPUID_CACHING
     stealth_init_cpuid_cache();
 #endif
 
     if (!ept_init())
     {
-        DbgPrintEx(0, 0, "[hv] EPT initialization failed!\n");
+        HV_LOG("EPT initialization failed!\n");
         return FALSE;
     }
 
-    for (UINT32 i = 0; i < g_cpu_count; i++)
+    for (UINT32 i = 0; i < g_vcpu_capacity; i++)
     {
-        VIRTUAL_MACHINE_STATE * vcpu = &g_vcpu[i];
-
-        //
-        // contiguous (page-aligned) so HOST_RSP is guaranteed 16-byte
-        // aligned — the asm exit handler's call alignment depends on it
-        //
-        vcpu->vmm_stack = (UINT64)hv_alloc_contiguous(VMM_STACK_SIZE);
-        if (!vcpu->vmm_stack)
-            return FALSE;
-        RtlZeroMemory((PVOID)vcpu->vmm_stack, VMM_STACK_SIZE);
-
-        //
-        // MSR Bitmap (1 page, all zeros = no MSR VM-exits)
-        //
-        vcpu->msr_bitmap_va = (UINT64)hv_pool_alloc(PAGE_SIZE);
-        if (!vcpu->msr_bitmap_va)
-            return FALSE;
-        RtlZeroMemory((PVOID)vcpu->msr_bitmap_va, PAGE_SIZE);
-
-        //
-        // intercept RDMSR(0x10) — IA32_TIME_STAMP_COUNTER
-        // per SDM 27.6.5, "use TSC offsetting" applies the offset to RDMSR(0x10)
-        // automatically. interception is only needed so the TSC compensation path
-        // can cover RDMSR-based timing attacks alongside RDTSC.
-        //
-        ((PUCHAR)vcpu->msr_bitmap_va)[0x10 / 8] |= (UCHAR)(1 << (0x10 % 8));
-
-        // IA32_FEATURE_CONTROL read+write
-        ((PUCHAR)vcpu->msr_bitmap_va)[0x3A / 8] |= (UCHAR)(1 << (0x3A % 8));
-        ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + 0x3A / 8] |= (UCHAR)(1 << (0x3A % 8));
-
-        // VMX capability MSRs (0x480-0x493) read+write
-        for (UINT32 msr_idx = 0x480; msr_idx <= 0x493; msr_idx++)
-        {
-            ((PUCHAR)vcpu->msr_bitmap_va)[msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
-            ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
-        }
-
-        vcpu->msr_bitmap_pa = va_to_pa(
-            (PVOID)vcpu->msr_bitmap_va);
-
-        //
-        // I/O Bitmap A (ports 0x0000 - 0x7FFF)
-        //
-        vcpu->io_bitmap_va_a = (UINT64)hv_pool_alloc(PAGE_SIZE);
-        if (!vcpu->io_bitmap_va_a)
-            return FALSE;
-        RtlZeroMemory((PVOID)vcpu->io_bitmap_va_a, PAGE_SIZE);
-        vcpu->io_bitmap_pa_a = va_to_pa(
-            (PVOID)vcpu->io_bitmap_va_a);
-
-        //
-        // I/O Bitmap B (ports 0x8000 - 0xFFFF)
-        //
-        vcpu->io_bitmap_va_b = (UINT64)hv_pool_alloc(PAGE_SIZE);
-        if (!vcpu->io_bitmap_va_b)
-            return FALSE;
-        RtlZeroMemory((PVOID)vcpu->io_bitmap_va_b, PAGE_SIZE);
-        vcpu->io_bitmap_pa_b = va_to_pa(
-            (PVOID)vcpu->io_bitmap_va_b);
-
-        //
-        // VMXON Region (pre-allocate at PASSIVE_LEVEL; VMXON runs per-core in DPC)
-        //
-        if (!vmx_alloc_vmxon(vcpu))
-            return FALSE;
-
-        //
-        // VMCS Region (pre-allocate at PASSIVE_LEVEL; VMCLEAR/VMPTRLD in DPC)
-        //
-        if (!vmx_alloc_vmcs(vcpu))
+        if (!vmx_alloc_vcpu_resources(&g_vcpu[i]))
             return FALSE;
     }
 
     //
-    // build private host page tables AFTER all allocations are done.
-    // The snapshot must include PTEs for VMM stacks, bitmaps, and all
-    // other structures accessed in host mode. Building before allocations
-    // would leave those VAs unmapped in host CR3 -> #PF -> double fault.
+    // build minimal private host page tables AFTER all allocations (including
+    // per-core host_gdt, VMM stacks, EPT tables, and root log ring).
     //
 #if USE_PRIVATE_HOST_CR3
     if (!hostcr3_build())
     {
-        DbgPrintEx(0, 0, "[hv] Host CR3 build failed!\n");
+        HV_LOG("Host CR3 build failed!\n");
         return FALSE;
     }
 #endif
 
-    //
-    // private host IDT to prevent NMI hijacking. must be built before
-    // broadcast_virtualize_all() so HOST_IDTR points to valid handlers.
-    //
 #if USE_PRIVATE_HOST_IDT
     if (!hostidt_build())
     {
-        DbgPrintEx(0, 0, "[hv] Host IDT build failed!\n");
+        HV_LOG("Host IDT build failed!\n");
         return FALSE;
     }
 #endif
@@ -621,12 +598,13 @@ vmx_init(VOID)
     {
         if (!g_vcpu[i].launched)
         {
-            DbgPrintEx(0, 0, "[hv] Core %u failed to launch!\n", i);
+            HV_LOG("Core %u failed to launch! Rolling back launched cores...\n", i);
+            broadcast_terminate_all();
             return FALSE;
         }
     }
 
-    DbgPrintEx(0, 0, "[hv] All %u cores virtualized successfully!\n", g_cpu_count);
+    HV_LOG("All %u cores virtualized successfully (capacity=%u)!\n", g_cpu_count, g_vcpu_capacity);
     return TRUE;
 }
 
@@ -636,28 +614,28 @@ vmx_terminate(VOID)
     if (!g_vcpu)
         return;
 
-    for (UINT32 i = 0; i < g_cpu_count; i++)
+    for (UINT32 i = 0; i < g_vcpu_capacity; i++)
     {
         VIRTUAL_MACHINE_STATE * vcpu = &g_vcpu[i];
-
-        //
-        // free per-VCPU resources.
-        // note: broadcast_terminate_all() must be called before this
-        // to VMCALL(VMXOFF) on each core and exit VMX operation.
-        //
 
         if (vcpu->vmxon_va)
             hv_free_contiguous((PVOID)vcpu->vmxon_va);
         if (vcpu->vmcs_va)
             hv_free_contiguous((PVOID)vcpu->vmcs_va);
-        if (vcpu->vmm_stack)
-            hv_free_contiguous((PVOID)vcpu->vmm_stack);
+        if (vcpu->vmm_stack_raw)
+            hv_free_contiguous(vcpu->vmm_stack_raw);
         if (vcpu->msr_bitmap_va)
-            hv_pool_free((PVOID)vcpu->msr_bitmap_va);
+            hv_free_contiguous((PVOID)vcpu->msr_bitmap_va);
         if (vcpu->io_bitmap_va_a)
-            hv_pool_free((PVOID)vcpu->io_bitmap_va_a);
+            hv_free_contiguous((PVOID)vcpu->io_bitmap_va_a);
         if (vcpu->io_bitmap_va_b)
-            hv_pool_free((PVOID)vcpu->io_bitmap_va_b);
+            hv_free_contiguous((PVOID)vcpu->io_bitmap_va_b);
+        if (vcpu->xss_bitmap_va)
+            hv_free_contiguous((PVOID)vcpu->xss_bitmap_va);
+
+#if USE_PRIVATE_HOST_GDT
+        hostgdt_destroy_for_vcpu(vcpu);
+#endif
     }
 
     ept_destroy();
@@ -670,17 +648,13 @@ vmx_terminate(VOID)
     hostidt_destroy();
 #endif
 
-#if USE_PRIVATE_HOST_GDT
-    for (UINT32 i = 0; i < g_cpu_count; i++)
-    {
-        hostgdt_destroy_for_vcpu(&g_vcpu[i]);
-    }
-#endif
+    logbuf_destroy();
 
     hv_pool_free(g_vcpu);
-    g_vcpu = NULL;
+    g_vcpu          = NULL;
+    g_vcpu_capacity = 0;
 
-    DbgPrintEx(0, 0, "[hv] VMX terminated on all cores.\n");
+    HV_LOG("VMX terminated on all cores.\n");
 }
 
 VOID

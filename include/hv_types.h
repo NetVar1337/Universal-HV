@@ -35,6 +35,8 @@
 #define MAX_RAM_RANGES          256
 #define EPT_DYN_POOL_PAGES      256         // pre-allocated pages for root-mode MMIO mapping
 #define EPT_MAX_TRACKED_PAGES   8192
+#define HV_MAX_WATCHPOINTS      32          // root-mode-safe EPT/NPT watchpoint table
+#define HV_LOG_RING_SIZE        1024        // power-of-2 lock-free root-mode log ring
 
 #define HV_POOL_TAG             'nhpO'
 
@@ -116,14 +118,29 @@ typedef struct _VMM_EPT_PAGE_TABLE {
     volatile LONG64 DynMappedCount;
 } VMM_EPT_PAGE_TABLE, *PVMM_EPT_PAGE_TABLE;
 
+typedef struct _EPT_WATCHPOINT {
+    BOOLEAN active;
+    UINT32  flags;              // HV_WP_TRAP_* bitmask
+    UINT64  phys_page;          // 4KB-aligned guest physical page
+    UINT64  orig_entry;         // original EPT/NPT PML1 entry before trapping
+    UINT64  trap_entry;         // restricted EPT/NPT PML1 entry
+    UINT64  *pte_va;            // VA of PML1 entry (mapped in host CR3)
+    volatile LONG64 hit_count;
+} EPT_WATCHPOINT, *PEPT_WATCHPOINT;
+
 typedef struct _EPT_STATE {
     MTRR_RANGE_DESCRIPTOR mem_ranges[MAX_MTRR_RANGES];
     UINT32                num_ranges;
     UINT8                 default_type;
     BOOLEAN               ad_supported;
+    BOOLEAN               huge_1gb_supported;   // 1GB EPT/NPT huge pages supported
     BOOLEAN               is_npt;               // TRUE on AMD (x86-64 PTE format), FALSE on Intel (EPT)
     UINT8                 npt_pat_index[8];     // maps MEMORY_TYPE_* -> 3-bit (PAT,PCD,PWT) index on AMD
-    LIST_ENTRY            hooked_pages;         // reserved for future EPT hooks
+    LIST_ENTRY            hooked_pages;         // reserved list head
+
+    EPT_WATCHPOINT        watchpoints[HV_MAX_WATCHPOINTS];
+    volatile LONG         wp_lock;
+    UINT32                active_watchpoints;
 
     //
     // physical memory map (from MmGetPhysicalMemoryRanges)
@@ -231,18 +248,29 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     UINT16  original_idt_limit;
 
     //
-    // per-vCPU diagnostics counters
+    // per-vCPU watchpoint single-step re-arm state (MTF on Intel, TF on AMD)
+    //
+    BOOLEAN wp_stepping;
+    UINT32  wp_step_index;
+    BOOLEAN wp_saved_tf;        // AMD: original guest RFLAGS.TF before single-step
+
+    //
+    // per-vCPU diagnostics & cycle profiler counters
     //
     UINT64  exit_count;
     UINT64  cpuid_exits;
     UINT64  msr_exits;
     UINT64  cr_exits;
     UINT64  ept_npt_exits;
+    UINT64  min_exit_cycles;
+    UINT64  max_exit_cycles;
+    UINT64  total_exit_cycles;
 
 } VIRTUAL_MACHINE_STATE, *PVIRTUAL_MACHINE_STATE;
 
 #define VMCALL_TEST             0x00000001
 #define VMCALL_VMXOFF           0x00000002
+#define VMCALL_INVEPT           0x00000003
 
 //
 // diagnostic snapshot written by private host IDT fault handlers before halting

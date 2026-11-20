@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  verify-host-and-asm:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC x64 Developer Shell
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Assemble all MASM x64 files
+        shell: cmd
+        run: |
+          mkdir build\ci-asm
+          for %%f in (asm\*.asm) do (
+            echo Assembling %%f...
+            ml64 /nologo /c /W3 /WX /D_AMD64_ /Fo"build\ci-asm\%%~nf.obj" "%%f" || exit /b 1
+          )
+
+      - name: Build usermode CLI (ophion-cli)
+        shell: cmd
+        run: |
+          mkdir build\ci-bin
+          cl /nologo /W4 /WX /O2 /Iinclude tools\ophion-cli\ophion_cli.c /Fe:build\ci-bin\ophion-cli.exe
+
+      - name: Build and run host unit tests
+        shell: cmd
+        run: |
+          cl /nologo /W4 /WX /O2 /Itests /Iinclude tests\unit_tests.c /Fe:build\ci-bin\unit_tests.exe
+          build\ci-bin\unit_tests.exe

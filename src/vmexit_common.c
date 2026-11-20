@@ -179,3 +179,184 @@ hv_common_validate_cr4(UINT64 val)
 
     return TRUE;
 }
+
+//
+// dynamic MSR tracing watchlist (shared across Intel VMX and AMD SVM)
+//
+#define HV_MAX_MSR_TRACES   32
+
+typedef struct _HV_MSR_TRACE_SLOT {
+    BOOLEAN active;
+    UINT32  msr;
+    BOOLEAN trace_read;
+    BOOLEAN trace_write;
+} HV_MSR_TRACE_SLOT;
+
+static HV_MSR_TRACE_SLOT g_msr_traces[HV_MAX_MSR_TRACES];
+static volatile LONG     g_msr_trace_lock = 0;
+
+static BOOLEAN
+hv_msr_in_bitmap_range(UINT32 msr, BOOLEAN is_amd)
+{
+    if (msr <= 0x00001FFFU)
+        return TRUE;
+    if (msr >= 0xC0000000U && msr <= 0xC0001FFFU)
+        return TRUE;
+    if (is_amd && msr >= 0xC0010000U && msr <= 0xC0011FFFU)
+        return TRUE;
+    return FALSE;
+}
+
+static VOID
+hv_update_vmx_msr_bitmap(PUINT8 bitmap, UINT32 msr, BOOLEAN read_on, BOOLEAN write_on)
+{
+    UINT32 read_off;
+    UINT32 write_off;
+    UINT32 idx;
+
+    if (msr <= 0x00001FFFU)
+    {
+        read_off  = 0x000;
+        write_off = 0x800;
+        idx       = msr;
+    }
+    else if (msr >= 0xC0000000U && msr <= 0xC0001FFFU)
+    {
+        read_off  = 0x400;
+        write_off = 0xC00;
+        idx       = msr - 0xC0000000U;
+    }
+    else
+    {
+        return;
+    }
+
+    UINT8 bit = (UINT8)(1U << (idx & 7U));
+    if (read_on)
+        bitmap[read_off + (idx >> 3)] |= bit;
+    else
+        bitmap[read_off + (idx >> 3)] &= (UINT8)~bit;
+
+    if (write_on)
+        bitmap[write_off + (idx >> 3)] |= bit;
+    else
+        bitmap[write_off + (idx >> 3)] &= (UINT8)~bit;
+}
+
+static VOID
+hv_update_svm_msrpm(PUINT8 msrpm, UINT32 msr, BOOLEAN read_on, BOOLEAN write_on)
+{
+    UINT32 base_offset;
+    UINT32 index;
+
+    if (msr <= 0x00001FFFU)
+    {
+        base_offset = 0x0000;
+        index = msr;
+    }
+    else if (msr >= 0xC0000000U && msr <= 0xC0001FFFU)
+    {
+        base_offset = 0x0800;
+        index = msr - 0xC0000000U;
+    }
+    else if (msr >= 0xC0010000U && msr <= 0xC0011FFFU)
+    {
+        base_offset = 0x1000;
+        index = msr - 0xC0010000U;
+    }
+    else
+    {
+        return;
+    }
+
+    UINT32 byte_idx  = base_offset + (index / 4);
+    UINT32 bit_shift = (index % 4) * 2;
+
+    if (read_on)
+        msrpm[byte_idx] |= (UINT8)(1U << bit_shift);
+    else
+        msrpm[byte_idx] &= (UINT8)~(1U << bit_shift);
+
+    if (write_on)
+        msrpm[byte_idx] |= (UINT8)(1U << (bit_shift + 1));
+    else
+        msrpm[byte_idx] &= (UINT8)~(1U << (bit_shift + 1));
+}
+
+BOOLEAN
+hv_set_msr_trace(UINT32 msr, BOOLEAN trace_read, BOOLEAN trace_write)
+{
+    if (!g_vcpu || !g_hv_backend)
+        return FALSE;
+
+    BOOLEAN is_amd = (g_hv_backend->vendor == HV_VENDOR_AMD) ? TRUE : FALSE;
+    if (!hv_msr_in_bitmap_range(msr, is_amd))
+        return FALSE;
+
+    //
+    // never let usermode disable mandatory stealth/virtualization intercepts
+    //
+    if (msr == 0x10U || msr == IA32_FEATURE_CONTROL ||
+        (msr >= IA32_VMX_BASIC && msr <= 0x493U) ||
+        msr == MSR_EFER || msr == MSR_VM_CR || msr == MSR_VM_HSAVE_PA)
+    {
+        return FALSE;
+    }
+
+    while (_InterlockedCompareExchange(&g_msr_trace_lock, 1, 0) != 0)
+        _mm_pause();
+
+    INT32 slot = -1;
+    for (UINT32 i = 0; i < HV_MAX_MSR_TRACES; i++)
+    {
+        if (g_msr_traces[i].active && g_msr_traces[i].msr == msr)
+        {
+            slot = (INT32)i;
+            break;
+        }
+        if (!g_msr_traces[i].active && slot < 0)
+            slot = (INT32)i;
+    }
+
+    if (slot < 0)
+    {
+        _InterlockedExchange(&g_msr_trace_lock, 0);
+        return FALSE;
+    }
+
+    if (!trace_read && !trace_write)
+    {
+        g_msr_traces[slot].active      = FALSE;
+        g_msr_traces[slot].trace_read  = FALSE;
+        g_msr_traces[slot].trace_write = FALSE;
+    }
+    else
+    {
+        g_msr_traces[slot].active      = TRUE;
+        g_msr_traces[slot].msr         = msr;
+        g_msr_traces[slot].trace_read  = trace_read;
+        g_msr_traces[slot].trace_write = trace_write;
+    }
+
+    for (UINT32 i = 0; i < g_vcpu_capacity; i++)
+    {
+        if (is_amd && g_vcpu[i].msrpm_va)
+            hv_update_svm_msrpm((PUINT8)g_vcpu[i].msrpm_va, msr, trace_read, trace_write);
+        else if (!is_amd && g_vcpu[i].msr_bitmap_va)
+            hv_update_vmx_msr_bitmap((PUINT8)g_vcpu[i].msr_bitmap_va, msr, trace_read, trace_write);
+    }
+
+    _InterlockedExchange(&g_msr_trace_lock, 0);
+    return TRUE;
+}
+
+BOOLEAN
+hv_is_msr_traced(UINT32 msr, BOOLEAN is_write)
+{
+    for (UINT32 i = 0; i < HV_MAX_MSR_TRACES; i++)
+    {
+        if (g_msr_traces[i].active && g_msr_traces[i].msr == msr)
+            return is_write ? g_msr_traces[i].trace_write : g_msr_traces[i].trace_read;
+    }
+    return FALSE;
+}

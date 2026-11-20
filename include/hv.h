@@ -9,6 +9,8 @@
 #include <ntddk.h>
 #include <intrin.h>
 
+#pragma intrinsic(_disable)
+
 #include "ia32.h"
 #include "hv_types.h"
 #include "hv_ioctl.h"
@@ -127,8 +129,33 @@ UINT64  ept_pml4_pa(VOID);
 BOOLEAN ept_is_npt_mode(VOID);
 UINT8   ept_get_memory_type(SIZE_T pfn, BOOLEAN is_large_page);
 BOOLEAN ept_valid_for_large_page(SIZE_T pfn);
+BOOLEAN ept_valid_for_1gb_page(SIZE_T pfn1gb);
 BOOLEAN ept_handle_dynamic_mmio(UINT64 gpa);
 BOOLEAN ept_map_into_hostcr3(VOID);
+
+//
+// EPT / NPT 4KB watchpoints (ept.c)
+//
+BOOLEAN ept_add_watchpoint(UINT64 phys_addr, UINT32 flags);
+BOOLEAN ept_remove_watchpoint(UINT64 phys_addr);
+INT32   ept_find_watchpoint_root(UINT64 gpa);
+VOID    ept_watchpoint_disarm_root(UINT32 idx);
+VOID    ept_watchpoint_rearm_root(UINT32 idx);
+
+//
+// lock-free root-mode ring-buffer logger (logbuf.c)
+//
+BOOLEAN logbuf_init(VOID);
+VOID    logbuf_destroy(VOID);
+BOOLEAN logbuf_map_into_hostcr3(VOID);
+VOID    logbuf_push_root(UINT32 cpu, UINT32 event_type, UINT64 arg1, UINT64 arg2);
+UINT32  logbuf_drain(PHV_LOG_ENTRY out_entries, UINT32 max_entries);
+
+//
+// dynamic MSR tracing helper (vmx.c / svm.c)
+//
+BOOLEAN hv_set_msr_trace(UINT32 msr, BOOLEAN trace_read, BOOLEAN trace_write);
+BOOLEAN hv_is_msr_traced(UINT32 msr, BOOLEAN is_write);
 
 PEPT_PML1_ENTRY ept_get_pml1(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 PEPT_PML2_ENTRY ept_get_pml2(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);

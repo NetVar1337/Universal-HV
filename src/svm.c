@@ -1,46 +1,21 @@
 /*
 *   svm.c - AMD SVM (AMD-V) backend
 *
-*   virtualizes the already-running Windows x64 OS on AMD CPUs using the
-*   VMCB/VMRUN mechanism. mirrors the VMX backend (vmx.c/vmexit.c):
-*   same intercepted operations (CPUID, MSR, CR0/3/4/8, DR0-7, VMMCALL,
-*   XSETBV, INVD/WBINVD, NPF), same shared identity-mapped NPT, same private
-*   host GDT/IDT/CR3 and stealth options.
-*
-*   differences vs VMX that are handled here:
-*     - EFER.SVME instead of CR4.VMXE; VM_HSAVE_PA host save area
-*     - ASID instead of VPID; NPT (nested_cr3) instead of EPT pointer
-*     - TPR lives in VMCB int_ctl.V_TPR instead of CR8
-*     - no way to fully "leave" SVM from inside the VMRUN loop: the
-*       shutdown VMMCALL clears all intercepts + disables NP so the vCPU
-*       resumes natively and never exits again (documented limitation).
+*   AMD APM Vol 2 compliant implementation:
+*     - Real VMLOAD -> VMRUN -> VMSAVE loop in AsmSvm.asm (hardware populates
+*       HSAVE automatically; never pokes opaque HSAVE offsets)
+*     - True x86-64 NPT tables built by ept.c + valid G_PAT in VMCB
+*     - Compressed AMD VMCB 16-bit segment attributes (svm_pack_attrib)
+*     - vmcb->Save.Efer keeps EFER.SVME=1 (required by VMRUN); MSRPM intercepts
+*       EFER/VM_CR/VM_HSAVE_PA/TSC/VMX MSRs to hide SVME and emulate stealth
+*     - Uses VMCB_CTRL_NEXT_RIP (NRIPS) for RIP advancement
+*     - No unconditional CR/DR intercepts (fast native guest execution)
+*     - Clean VMCALL_VMXOFF exit: restores guest CR3/GDTR/IDTR/hidden state,
+*       executes STGI with IF=0, clears EFER.SVME, and returns natively so all
+*       VMCB/HSAVE/NPT resources can be freed safely
+*     - ZERO Windows API calls inside svm_exit_handler
 */
 #include "hv.h"
-
-static __forceinline UINT64 *
-svm_gpr_ptr(PGUEST_REGS regs, UINT32 idx)
-{
-    switch (idx)
-    {
-    case 0:  return &regs->rax;
-    case 1:  return &regs->rcx;
-    case 2:  return &regs->rdx;
-    case 3:  return &regs->rbx;
-    case 4:  return &regs->rsp;
-    case 5:  return &regs->rbp;
-    case 6:  return &regs->rsi;
-    case 7:  return &regs->rdi;
-    case 8:  return &regs->r8;
-    case 9:  return &regs->r9;
-    case 10: return &regs->r10;
-    case 11: return &regs->r11;
-    case 12: return &regs->r12;
-    case 13: return &regs->r13;
-    case 14: return &regs->r14;
-    case 15: return &regs->r15;
-    default: return &regs->rax;
-    }
-}
 
 static __forceinline VOID
 svm_inject_exc(PVMCB vmcb, UINT32 vector, BOOLEAN with_err, UINT32 err)
@@ -65,94 +40,68 @@ svm_inject_gp(PVMCB vmcb)
 }
 
 static VOID
-svm_fill_segment(PVMCB vmcb, PSVM_SEGMENT dest, UINT64 gdt_base, UINT16 selector)
+svm_fill_segment(PSVM_SEGMENT dest, UINT64 gdt_base, UINT16 selector)
 {
     VMX_SEGMENT_SELECTOR seg = {0};
-
-    UNREFERENCED_PARAMETER(vmcb);
 
     segment_get_descriptor((PUCHAR)gdt_base, selector, &seg);
 
     dest->Selector = selector;
-    dest->Attrib   = (selector == 0) ? 0 : (UINT16)(seg.Attributes.AsUInt & 0xFFFF);
+    dest->Attrib   = (selector == 0) ? 0 : svm_pack_attrib(seg.Attributes.AsUInt);
     dest->Limit    = seg.Limit;
     dest->Base     = seg.Base;
 }
 
-/*
-*   CPUID — same stealth policy as the VMX backend, plus hiding the AMD SVM
-*   leaf (0x8000000A) and the SVM capability bit (CPUID.80000001:ECX[2]).
-*/
-static VOID
-svm_handle_cpuid(PVMCB vmcb, VIRTUAL_MACHINE_STATE * vcpu, PGUEST_REGS regs)
+static UINT64
+svm_compute_next_rip(PVMCB vmcb)
 {
-    INT32  cpu_info[4] = {0};
-    UINT32 leaf    = (UINT32)regs->rax;
-    UINT32 subleaf = (UINT32)regs->rcx;
-
-    UNREFERENCED_PARAMETER(vmcb);
-
-#if STEALTH_CPUID_CACHING
-    if (g_stealth_enabled && stealth_is_leaf_invalid(leaf))
+    if (g_cpu.svm_features & SVM_FEATURE_NRIPS)
     {
-        cpu_info[0] = g_stealth_cpuid_cache.invalid_leaf[0];
-        cpu_info[1] = g_stealth_cpuid_cache.invalid_leaf[1];
-        cpu_info[2] = g_stealth_cpuid_cache.invalid_leaf[2];
-        cpu_info[3] = g_stealth_cpuid_cache.invalid_leaf[3];
-    }
-    else
-#endif
-    {
-        __cpuidex(cpu_info, (int)leaf, (int)subleaf);
-
-        if (g_stealth_enabled)
-        {
-            if (leaf == 1)
-                cpu_info[2] &= ~(1 << 31);              // hypervisor present bit
-
-            if (leaf == CPUID_EXT_FEATURES)
-                cpu_info[2] &= ~(1 << CPUID_SVM_BIT);   // hide SVM capability
-
-            if (leaf == CPUID_SVM_INFO)
-            {
-                //
-                // bare metal with SVM firmware-disabled returns zeros for
-                // this leaf; hide the hypervisor's SVM info entirely.
-                //
-                cpu_info[0] = cpu_info[1] = cpu_info[2] = cpu_info[3] = 0;
-            }
-        }
+        UINT64 next_rip = svm_ctrl_read(vmcb, VMCB_CTRL_NEXT_RIP);
+        if (next_rip != 0)
+            return next_rip;
     }
 
-    regs->rax = (UINT64)(UINT32)cpu_info[0];
-    regs->rbx = (UINT64)(UINT32)cpu_info[1];
-    regs->rcx = (UINT64)(UINT32)cpu_info[2];
-    regs->rdx = (UINT64)(UINT32)cpu_info[3];
-
-    UNREFERENCED_PARAMETER(vcpu);
+    //
+    // fallback if NRIPS is unavailable: decode length from guest instruction bytes
+    //
+    UINT8 insn_len = *(PUINT8)((PUINT8)vmcb->Control + VMCB_CTRL_INSN_LEN);
+    if (insn_len == 0)
+        insn_len = 2; // CPUID, RDMSR, WRMSR, INVD, WBINVD are all 2 bytes
+    return vmcb->Save.Rip + insn_len;
 }
 
-/*
-*   MSR — INTERCEPT_MSR_PROT sends every guest RDMSR/WRMSR here.
-*   exit_info1 bit 0: 0 = RDMSR, 1 = WRMSR. MSR number is in guest RCX.
-*
-*   since host == guest (type-2), forwarding architectural MSRs to the
-*   hardware is semantically correct; synthetic/intel-only MSRs get #GP
-*   exactly like bare metal, and EFER.SVME is hidden from the guest.
-*/
+UINT64
+svm_return_rsp_for_off(VIRTUAL_MACHINE_STATE * vcpu)
+{
+    return vcpu->vmxoff.guest_rsp;
+}
+
+UINT64
+svm_return_rip_for_off(VIRTUAL_MACHINE_STATE * vcpu)
+{
+    return vcpu->vmxoff.guest_rip;
+}
+
+UINT64
+svm_return_rflags_for_off(VIRTUAL_MACHINE_STATE * vcpu)
+{
+    return vcpu->vmxoff.guest_rflags;
+}
+
 static VOID
 svm_handle_msr(PVMCB vmcb, VIRTUAL_MACHINE_STATE * vcpu, PGUEST_REGS regs, BOOLEAN is_write, BOOLEAN * advance)
 {
-    UINT32 msr = (UINT32)(regs->rcx & 0xFFFFFFFF);
-    UINT64 value = ((UINT64)(UINT32)regs->rdx << 32) | (UINT32)regs->rax;
+    UINT32 msr   = (UINT32)(regs->rcx & 0xFFFFFFFFU);
+    UINT64 value = ((UINT64)(UINT32)regs->rdx << 32) | (UINT64)(UINT32)regs->rax;
 
-    UNREFERENCED_PARAMETER(vcpu);
+    vcpu->msr_exits++;
 
     //
-    // hypervisor synthetic MSRs and Intel-only MSRs -> #GP like bare AMD metal
+    // hypervisor synthetic MSRs, Intel-only VMX MSRs, and SVM control MSRs -> #GP
     //
-    if ((msr >= 0x40000000 && msr <= 0x4FFFFFFF) ||
-        (msr >= IA32_VMX_BASIC && msr <= 0x493) ||
+    if (hv_common_is_synthetic_msr(msr) ||
+        (msr >= IA32_VMX_BASIC && msr <= 0x493U) ||
         msr == IA32_FEATURE_CONTROL ||
         msr == MSR_VM_CR || msr == MSR_VM_HSAVE_PA)
     {
@@ -167,16 +116,18 @@ svm_handle_msr(PVMCB vmcb, VIRTUAL_MACHINE_STATE * vcpu, PGUEST_REGS regs, BOOLE
         {
         case MSR_EFER:
             //
-            // guest EFER must never clear SVME while the hypervisor is
-            // loaded; keep the host's SVME=1 and shadow the rest.
+            // VMRUN requires EFER.SVME=1 in vmcb->Save.Efer; keep SVME=1 in
+            // hardware/VMCB while masking it off on guest RDMSR(MSR_EFER).
             //
-            __writemsr(MSR_EFER, value | EFER_SVME);
-            vmcb->Save.Efer = value & ~EFER_SVME;
+            vmcb->Save.Efer = value | EFER_SVME;
             break;
 
         default:
-            if ((msr <= 0x00001FFF) || (msr >= 0xC0000000 && msr <= 0xC0001FFF))
+            if (hv_is_msr_traced(msr, TRUE))
+            {
+                logbuf_push_root(vcpu->core_id, HV_LOG_EVT_MSR_WRITE_TRACE, msr, value);
                 __writemsr(msr, value);
+            }
             else
             {
                 svm_inject_gp(vmcb);
@@ -187,11 +138,11 @@ svm_handle_msr(PVMCB vmcb, VIRTUAL_MACHINE_STATE * vcpu, PGUEST_REGS regs, BOOLE
     }
     else
     {
-        UINT64 result;
+        UINT64 result = 0;
 
         switch (msr)
         {
-        case 0x10:  // IA32_TIME_STAMP_COUNTER — apply TSC offset manually
+        case 0x10U: // IA32_TIME_STAMP_COUNTER
         {
             UINT64 tsc_offset = svm_ctrl_read(vmcb, VMCB_CTRL_TSC_OFFSET);
             result = (UINT64)((INT64)__rdtsc() + (INT64)tsc_offset);
@@ -199,12 +150,15 @@ svm_handle_msr(PVMCB vmcb, VIRTUAL_MACHINE_STATE * vcpu, PGUEST_REGS regs, BOOLE
         }
 
         case MSR_EFER:
-            result = __readmsr(MSR_EFER) & ~EFER_SVME;   // hide SVME from guest
+            result = vmcb->Save.Efer & ~EFER_SVME;
             break;
 
         default:
-            if ((msr <= 0x00001FFF) || (msr >= 0xC0000000 && msr <= 0xC0001FFF))
+            if (hv_is_msr_traced(msr, FALSE))
+            {
                 result = __readmsr(msr);
+                logbuf_push_root(vcpu->core_id, HV_LOG_EVT_MSR_READ_TRACE, msr, result);
+            }
             else
             {
                 svm_inject_gp(vmcb);
@@ -214,221 +168,124 @@ svm_handle_msr(PVMCB vmcb, VIRTUAL_MACHINE_STATE * vcpu, PGUEST_REGS regs, BOOLE
             break;
         }
 
-        regs->rax = result & 0xFFFFFFFF;
+        regs->rax = result & 0xFFFFFFFFULL;
         regs->rdx = result >> 32;
     }
 }
 
-static VOID
-svm_handle_cr(PVMCB vmcb, VIRTUAL_MACHINE_STATE * vcpu, PGUEST_REGS regs, UINT64 exit_code, UINT64 info1)
+static BOOLEAN
+svm_handle_vmmcall(PVMCB vmcb, VIRTUAL_MACHINE_STATE * vcpu, PGUEST_REGS regs, BOOLEAN * advance)
 {
-    UINT32   gpr = (UINT32)(info1 & SVM_EXITINFO_REG_MASK);
-    UINT64 * reg_ptr = svm_gpr_ptr(regs, gpr);
-    BOOLEAN  is_write = (exit_code >= SVM_EXIT_WRITE_CR0 && exit_code <= SVM_EXIT_WRITE_CR8);
-    UINT32   cr;
-
-    switch (exit_code)
-    {
-    case SVM_EXIT_READ_CR0:  case SVM_EXIT_WRITE_CR0:  cr = 0; break;
-    case SVM_EXIT_READ_CR3:  case SVM_EXIT_WRITE_CR3:  cr = 3; break;
-    case SVM_EXIT_READ_CR4:  case SVM_EXIT_WRITE_CR4:  cr = 4; break;
-    case SVM_EXIT_READ_CR8:  case SVM_EXIT_WRITE_CR8:  cr = 8; break;
-    default: return;
-    }
-
-    if (is_write)
-    {
-        UINT64 val = *reg_ptr;
-        switch (cr)
-        {
-        case 0:
-            vmcb->Save.Cr0 = val;
-            break;
-        case 3:
-        {
-            BOOLEAN no_flush = (val >> 63) & 1;     // PCID no-invalidate bit
-            vmcb->Save.Cr3 = val & ~(1ULL << 63);
-            if (!no_flush)
-                svm_ctrl_write32(vmcb, VMCB_CTRL_TLB_CTL, SVM_TLB_FLUSH_ASID);
-            break;
-        }
-        case 4:
-            vmcb->Save.Cr4 = val;
-            break;
-        case 8:
-            vcpu->guest_cr8 = (UINT8)(val & 0xF);
-            {
-                UINT32 ic = (UINT32)svm_ctrl_read(vmcb, VMCB_CTRL_INT_CTL);
-                ic = (ic & ~SVM_V_TPR_MASK) | vcpu->guest_cr8;
-                svm_ctrl_write32(vmcb, VMCB_CTRL_INT_CTL, ic);
-            }
-            break;
-        }
-    }
-    else
-    {
-        switch (cr)
-        {
-        case 0: *reg_ptr = vmcb->Save.Cr0; break;
-        case 3: *reg_ptr = vmcb->Save.Cr3; break;
-        case 4: *reg_ptr = vmcb->Save.Cr4; break;
-        case 8: *reg_ptr = vcpu->guest_cr8; break;
-        }
-    }
-}
-
-static VOID
-svm_handle_dr(PVMCB vmcb, PGUEST_REGS regs, UINT64 exit_code, UINT64 info1)
-{
-    UINT32 gpr = (UINT32)(info1 & SVM_EXITINFO_REG_MASK);
-    UINT64 * reg_ptr = svm_gpr_ptr(regs, gpr);
-    UINT32 dr;
-    BOOLEAN is_write;
-
-    UNREFERENCED_PARAMETER(vmcb);
-
-    if (exit_code >= SVM_EXIT_WRITE_DR0 && exit_code <= SVM_EXIT_WRITE_DR7)
-    {
-        is_write = TRUE;
-        dr = (UINT32)(exit_code - SVM_EXIT_WRITE_DR0);
-    }
-    else
-    {
-        is_write = FALSE;
-        dr = (UINT32)(exit_code - SVM_EXIT_READ_DR0);
-    }
-
-    //
-    // DR4/DR5 alias DR6/DR7 when CR4.DE=0, #UD when CR4.DE=1
-    //
-    if (dr == 4 || dr == 5)
-    {
-        if (vmcb->Save.Cr4 & (1ULL << 3))
-        {
-            svm_inject_ud(vmcb);
-            return;
-        }
-        dr = (dr == 4) ? 6 : 7;
-    }
-
-    //
-    // host and guest are the same OS (type-2): DR0-3 are not part of the
-    // VMCB, so forward directly to the hardware debug registers.
-    //
-    if (is_write)
-        __writedr(dr, *reg_ptr);
-    else
-        *reg_ptr = __readdr(dr);
-}
-
-static VOID
-svm_handle_vmmcall(PVMCB vmcb, VIRTUAL_MACHINE_STATE * vcpu, PGUEST_REGS regs)
-{
-    //
-    // reject VMMCALL from ring 3 — only kernel callers allowed
-    //
-    if (vmcb->Save.Cpl != 0)
+    if (!hv_common_check_vmcall_auth(regs, vmcb->Save.Cpl))
     {
         svm_inject_ud(vmcb);
-        return;
-    }
-
-    if (regs->r10 != 0x48564653ULL ||
-        regs->r11 != 0x564d43414c4cULL ||
-        regs->r12 != 0x4e4f485950455256ULL)
-    {
-        svm_inject_ud(vmcb);
-        return;
+        *advance = FALSE;
+        return FALSE;
     }
 
     switch (regs->rcx)
     {
     case VMCALL_TEST:
         regs->rax = (UINT64)STATUS_SUCCESS;
-        break;
+        return FALSE;
+
+    case VMCALL_INVEPT:
+        svm_ctrl_write32(vmcb, VMCB_CTRL_TLB_CTL, SVM_TLB_FLUSH_ASID);
+        regs->rax = (UINT64)STATUS_SUCCESS;
+        return FALSE;
 
     case VMCALL_VMXOFF:
+    {
         //
-        // SVM cannot be fully exited from inside the VMRUN loop (VMRUN
-        // itself requires EFER.SVME=1). the equivalent shutdown is to clear
-        // every intercept and disable nested paging: the vCPU resumes and
-        // never #VMEXITs again, so the driver can safely free all state.
+        // clean AMD SVM exit (AMD APM Vol 2):
+        //   1. Save guest RIP/RSP/RFLAGS for SvmOffPath.
+        //   2. Ensure IF=0 (CLI), switch CR3 back to guest CR3.
+        //   3. Restore live guest IDTR and GDTR.
+        //   4. VMLOAD guest VMCB to restore FS/GS/TR/LDTR/KernelGsBase/LSTAR/...
+        //   5. STGI (requires EFER.SVME==1; safe because IF==0).
+        //   6. Clear EFER.SVME (CPU is now 100% out of SVM mode).
+        //   7. Return TRUE -> SvmOffPath restores GPRs/XMM/RFLAGS/RSP -> guest RIP!
         //
-        svm_clear_all_intercepts(vmcb);
-        svm_ctrl_write(vmcb, VMCB_CTRL_MISC_CTL, 0);
-        svm_ctrl_write32(vmcb, VMCB_CTRL_TLB_CTL, SVM_TLB_FLUSH_ALL_ASID);
-        vcpu->svm_off = TRUE;
+        UINT64 next_rip = svm_compute_next_rip(vmcb);
+
+        vcpu->vmxoff.guest_rip    = next_rip;
+        vcpu->vmxoff.guest_rsp    = vmcb->Save.Rsp;
+        vcpu->vmxoff.guest_rflags = vmcb->Save.Rflags;
+        vcpu->vmxoff.guest_cr3    = vmcb->Save.Cr3;
+        vcpu->svm_off             = TRUE;
+        *advance                  = FALSE;
+
+        _disable();
+
+        __writecr3(vmcb->Save.Cr3);
+        asm_reload_idtr((PVOID)vmcb->Save.Idtr.Base, vmcb->Save.Idtr.Limit);
+        asm_reload_gdtr((PVOID)vmcb->Save.Gdtr.Base, vmcb->Save.Gdtr.Limit);
+
+        asm_svm_vmload(vcpu->vmcb_pa);
+        asm_stgi();
+        asm_svm_disable();
+
         regs->rax = (UINT64)STATUS_SUCCESS;
-        break;
+        return TRUE;
+    }
 
     default:
         regs->rax = (UINT64)STATUS_UNSUCCESSFUL;
-        break;
+        return FALSE;
     }
 }
 
 /*
-*   svm_exit_handler — C entry from asm_svmexit_handler.
-*   always resumes the guest with VMRUN afterwards (returns void; the asm
-*   stub performs the VMRUN).
+*   svm_exit_handler — C entry from AsmSvm.asm SvmLoop.
+*   returns TRUE when tearing down SVM (SvmOffPath), FALSE to resume VMRUN.
+*   ZERO Windows API calls!
 */
-VOID
+BOOLEAN
 svm_exit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 {
-    PVMCB  vmcb = (PVMCB)vcpu->vmcb_va;
-    UINT64 exit_code = svm_ctrl_read(vmcb, VMCB_CTRL_EXIT_CODE);
-    UINT64 info1     = svm_ctrl_read(vmcb, VMCB_CTRL_EXIT_INFO1);
-    UINT64 info2     = svm_ctrl_read(vmcb, VMCB_CTRL_EXIT_INFO2);
-    BOOLEAN advance = TRUE;
+    UINT64  exit_tsc_start = __rdtsc();
+    PVMCB   vmcb           = (PVMCB)vcpu->vmcb_va;
+    UINT64  exit_code      = svm_ctrl_read(vmcb, VMCB_CTRL_EXIT_CODE);
+    UINT64  info1          = svm_ctrl_read(vmcb, VMCB_CTRL_EXIT_INFO1);
+    UINT64  info2          = svm_ctrl_read(vmcb, VMCB_CTRL_EXIT_INFO2);
+    BOOLEAN advance        = TRUE;
+    BOOLEAN do_svm_off     = FALSE;
+
+    //
+    // reset one-shot TLB flush control from any previous exit
+    //
+    svm_ctrl_write32(vmcb, VMCB_CTRL_TLB_CTL, SVM_TLB_DO_NOTHING);
 
     vcpu->regs        = regs;
     vcpu->in_root     = TRUE;
     vcpu->exit_reason = (UINT32)exit_code;
     vcpu->exit_qual   = info2;
+    vcpu->exit_count++;
 
     //
-    // on #VMEXIT only RIP/RSP/RAX come from the VMCB; the rest of the GPRs
-    // are in the pushed register frame. guest RAX lives in save.rax.
+    // guest RAX/RSP/RIP live in VMCB save area
     //
-    regs->rax     = vmcb->Save.Rax;
-    regs->rsp     = vmcb->Save.Rsp;
+    regs->rax        = vmcb->Save.Rax;
+    regs->rsp        = vmcb->Save.Rsp;
     vcpu->vmexit_rip = vmcb->Save.Rip;
-    vcpu->guest_cr8  = (UINT8)(svm_ctrl_read(vmcb, VMCB_CTRL_INT_CTL) & SVM_V_TPR_MASK);
 
     switch (exit_code)
     {
     case SVM_EXIT_CPUID:
-        svm_handle_cpuid(vmcb, vcpu, regs);
+        vcpu->cpuid_exits++;
+        hv_common_handle_cpuid(regs, TRUE);
         break;
 
     case SVM_EXIT_MSR:
-        svm_handle_msr(vmcb, vcpu, regs, (info1 & 1) ? TRUE : FALSE, &advance);
-        break;
-
-    case SVM_EXIT_READ_CR0: case SVM_EXIT_READ_CR3:
-    case SVM_EXIT_READ_CR4: case SVM_EXIT_READ_CR8:
-    case SVM_EXIT_WRITE_CR0: case SVM_EXIT_WRITE_CR3:
-    case SVM_EXIT_WRITE_CR4: case SVM_EXIT_WRITE_CR8:
-        svm_handle_cr(vmcb, vcpu, regs, exit_code, info1);
-        break;
-
-    case SVM_EXIT_READ_DR0:  case SVM_EXIT_READ_DR1:
-    case SVM_EXIT_READ_DR2:  case SVM_EXIT_READ_DR3:
-    case SVM_EXIT_READ_DR4:  case SVM_EXIT_READ_DR5:
-    case SVM_EXIT_READ_DR6:  case SVM_EXIT_READ_DR7:
-    case SVM_EXIT_WRITE_DR0: case SVM_EXIT_WRITE_DR1:
-    case SVM_EXIT_WRITE_DR2: case SVM_EXIT_WRITE_DR3:
-    case SVM_EXIT_WRITE_DR4: case SVM_EXIT_WRITE_DR5:
-    case SVM_EXIT_WRITE_DR6: case SVM_EXIT_WRITE_DR7:
-        svm_handle_dr(vmcb, regs, exit_code, info1);
+        svm_handle_msr(vmcb, vcpu, regs, (info1 & 1ULL) ? TRUE : FALSE, &advance);
         break;
 
     case SVM_EXIT_VMMCALL:
-        svm_handle_vmmcall(vmcb, vcpu, regs);
+        do_svm_off = svm_handle_vmmcall(vmcb, vcpu, regs, &advance);
         break;
 
     //
-    // SVM instructions in guest — inject #UD (bare metal behavior)
+    // SVM instructions in guest -> #UD (matches bare metal with SVM hidden)
     //
     case SVM_EXIT_VMRUN:
     case SVM_EXIT_VMLOAD:
@@ -441,20 +298,12 @@ svm_exit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         break;
 
     case SVM_EXIT_XSETBV:
-    {
-        UINT64 index = regs->rcx;
-        UINT64 value = ((UINT64)(UINT32)regs->rdx << 32) | (UINT32)regs->rax;
-
-        if ((index & 0xFFFFFFFF00000000ULL) || (UINT32)index != 0 ||
-            !stealth_is_xcr0_valid(value))
+        if (!hv_common_handle_xsetbv(regs))
         {
             svm_inject_gp(vmcb);
             advance = FALSE;
-            break;
         }
-        _xsetbv(0, value);
         break;
-    }
 
     case SVM_EXIT_INVD:
     case SVM_EXIT_WBINVD:
@@ -462,44 +311,102 @@ svm_exit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         break;
 
     case SVM_EXIT_NPF:
+    {
+        vcpu->ept_npt_exits++;
+
         //
-        // nested page fault: with a full identity map this should never
-        // happen; if it does, the guest gets #GP (mirrors the VMX EPT
-        // violation path).
+        // 1. check for an active NPT 4KB watchpoint on this GPA (info2)
         //
+        INT32 wp_idx = ept_find_watchpoint_root(info2);
+        if (wp_idx >= 0)
+        {
+            logbuf_push_root(vcpu->core_id, HV_LOG_EVT_WATCHPOINT_HIT, info2, vcpu->vmexit_rip);
+            ept_watchpoint_disarm_root((UINT32)wp_idx);
+            svm_ctrl_write32(vmcb, VMCB_CTRL_TLB_CTL, SVM_TLB_FLUSH_ASID);
+
+            //
+            // single-step via #DB intercept + guest RFLAGS.TF, then re-arm
+            //
+            vcpu->wp_stepping   = TRUE;
+            vcpu->wp_step_index = (UINT32)wp_idx;
+            vcpu->wp_saved_tf   = (vmcb->Save.Rflags & RFLAGS_TF) ? TRUE : FALSE;
+            vmcb->Save.Rflags  |= RFLAGS_TF;
+            svm_set_intercept(vmcb, SVM_INT_EXCEPTION_BASE + EXCEPTION_VECTOR_DEBUG);
+
+            advance = FALSE;
+            break;
+        }
+
+        //
+        // 2. check if unmapped above-4G MMIO (64-bit PCIe / Resizable BAR)
+        //
+        if (ept_handle_dynamic_mmio(info2))
+        {
+            svm_ctrl_write32(vmcb, VMCB_CTRL_TLB_CTL, SVM_TLB_FLUSH_ASID);
+            logbuf_push_root(vcpu->core_id, HV_LOG_EVT_DYN_MMIO, info2, vcpu->vmexit_rip);
+            advance = FALSE;
+            break;
+        }
+
         svm_inject_gp(vmcb);
         advance = FALSE;
         break;
+    }
+
+    case (SVM_EXIT_EXCP_BASE + EXCEPTION_VECTOR_DEBUG):
+    {
+        if (vcpu->wp_stepping)
+        {
+            svm_clear_intercept(vmcb, SVM_INT_EXCEPTION_BASE + EXCEPTION_VECTOR_DEBUG);
+            if (!vcpu->wp_saved_tf)
+                vmcb->Save.Rflags &= ~RFLAGS_TF;
+            ept_watchpoint_rearm_root(vcpu->wp_step_index);
+            svm_ctrl_write32(vmcb, VMCB_CTRL_TLB_CTL, SVM_TLB_FLUSH_ASID);
+            vcpu->wp_stepping = FALSE;
+
+            if (vcpu->wp_saved_tf)
+                svm_inject_exc(vmcb, EXCEPTION_VECTOR_DEBUG, FALSE, 0);
+        }
+        else
+        {
+            svm_inject_exc(vmcb, EXCEPTION_VECTOR_DEBUG, FALSE, 0);
+        }
+        advance = FALSE;
+        break;
+    }
 
     case SVM_EXIT_SHUTDOWN:
         advance = FALSE;
         break;
 
     default:
-        //
-        // exceptions/interrupts are not intercepted and are delivered to the
-        // guest directly by hardware; anything else here is unexpected.
-        //
-        DbgPrintEx(0, 0, "[hv] svm: unhandled exit 0x%llx (info1=0x%llx info2=0x%llx)\n",
-                 exit_code, info1, info2);
+        logbuf_push_root(vcpu->core_id, HV_LOG_EVT_UNHANDLED_EXIT, exit_code, info2);
+        advance = FALSE;
         break;
     }
 
-    //
-    // advance guest RIP past the intercepted instruction
-    //
-    if (advance)
+    if (!do_svm_off)
     {
-        UINT8 insn_len = *(PUINT8)((PUINT8)vmcb->Control + VMCB_CTRL_INSN_LEN);
-        vmcb->Save.Rip += insn_len;
+        if (advance)
+            vmcb->Save.Rip = svm_compute_next_rip(vmcb);
+
+        vmcb->Save.Rax = regs->rax;
     }
 
     //
-    // write back guest RAX (CPUID/MSR/VMMCALL results)
+    // update per-vCPU cycle profiler
     //
-    vmcb->Save.Rax = regs->rax;
+    {
+        UINT64 elapsed = __rdtsc() - exit_tsc_start;
+        vcpu->total_exit_cycles += elapsed;
+        if (elapsed < vcpu->min_exit_cycles)
+            vcpu->min_exit_cycles = elapsed;
+        if (elapsed > vcpu->max_exit_cycles)
+            vcpu->max_exit_cycles = elapsed;
+    }
 
     vcpu->in_root = FALSE;
+    return do_svm_off;
 }
 
 BOOLEAN
@@ -508,18 +415,15 @@ svm_check_support(VOID)
     if (!cpuinfo_svm_check())
         return FALSE;
 
-    //
-    // nested paging is required (no shadow-paging fallback)
-    //
     if (!(g_cpu.svm_features & SVM_FEATURE_NP))
     {
-        DbgPrintEx(0, 0, "[hv] SVM: nested paging (NPT) not supported on this CPU\n");
+        HV_LOG("SVM: nested paging (NPT) not supported on this CPU\n");
         return FALSE;
     }
 
     if (g_cpu.svm_num_asids < 2)
     {
-        DbgPrintEx(0, 0, "[hv] SVM: insufficient ASIDs (%u)\n", g_cpu.svm_num_asids);
+        HV_LOG("SVM: insufficient ASIDs (%u)\n", g_cpu.svm_num_asids);
         return FALSE;
     }
 
@@ -530,33 +434,28 @@ BOOLEAN
 svm_virtualize_cpu(PVOID guest_stack)
 {
     ULONG                   idx  = hv_current_processor_index();
-    VIRTUAL_MACHINE_STATE * vcpu = &g_vcpu[idx];
+    VIRTUAL_MACHINE_STATE * vcpu = NULL;
     PVMCB                   vmcb;
     UINT64                  gdt_base;
+
+    if (!g_vcpu || idx >= g_vcpu_capacity)
+        return FALSE;
+
+    vcpu = &g_vcpu[idx];
+    if (vcpu->launched)
+        return TRUE;
 
     vcpu->proc_index = idx;
     vcpu->core_id    = idx;
     vcpu->asid       = 1;
+    vcpu->svm_off    = FALSE;
 
     vmcb = (PVMCB)vcpu->vmcb_va;
     RtlZeroMemory(vmcb, PAGE_SIZE);
 
     //
-    // intercepts
+    // intercept only what is required (no unconditional CR/DR exits!)
     //
-    svm_set_intercept(vmcb, SVM_INT_CR0_READ);
-    svm_set_intercept(vmcb, SVM_INT_CR3_READ);
-    svm_set_intercept(vmcb, SVM_INT_CR4_READ);
-    svm_set_intercept(vmcb, SVM_INT_CR8_READ);
-    svm_set_intercept(vmcb, SVM_INT_CR0_WRITE);
-    svm_set_intercept(vmcb, SVM_INT_CR3_WRITE);
-    svm_set_intercept(vmcb, SVM_INT_CR4_WRITE);
-    svm_set_intercept(vmcb, SVM_INT_CR8_WRITE);
-    for (UINT32 i = 0; i < 8; i++)
-    {
-        svm_set_intercept(vmcb, SVM_INT_DR0_READ + i);
-        svm_set_intercept(vmcb, SVM_INT_DR0_WRITE + i);
-    }
     svm_set_intercept(vmcb, SVM_INT_CPUID);
     svm_set_intercept(vmcb, SVM_INT_MSR_PROT);
     svm_set_intercept(vmcb, SVM_INT_VMMCALL);
@@ -569,41 +468,55 @@ svm_virtualize_cpu(PVOID guest_stack)
     svm_set_intercept(vmcb, SVM_INT_XSETBV);
     svm_set_intercept(vmcb, SVM_INT_INVD);
     svm_set_intercept(vmcb, SVM_INT_WBINVD);
+    svm_set_intercept(vmcb, SVM_INT_SHUTDOWN);
 
-    svm_ctrl_write(vmcb, VMCB_CTRL_IOPM_BASE_PA, vcpu->iopm_pa);
+    svm_ctrl_write(vmcb, VMCB_CTRL_IOPM_BASE_PA,  vcpu->iopm_pa);
     svm_ctrl_write(vmcb, VMCB_CTRL_MSRPM_BASE_PA, vcpu->msrpm_pa);
-    svm_ctrl_write(vmcb, VMCB_CTRL_TSC_OFFSET, 0);
-    svm_ctrl_write32(vmcb, VMCB_CTRL_ASID, vcpu->asid);
-    svm_ctrl_write32(vmcb, VMCB_CTRL_TLB_CTL, SVM_TLB_DO_NOTHING);
-    svm_ctrl_write32(vmcb, VMCB_CTRL_INT_CTL, 0);
-    svm_ctrl_write32(vmcb, VMCB_CTRL_EVENT_INJ, 0);
+    svm_ctrl_write(vmcb, VMCB_CTRL_TSC_OFFSET,    0);
+    svm_ctrl_write32(vmcb, VMCB_CTRL_ASID,        vcpu->asid);
+    svm_ctrl_write32(vmcb, VMCB_CTRL_TLB_CTL,     SVM_TLB_DO_NOTHING);
+    svm_ctrl_write32(vmcb, VMCB_CTRL_INT_CTL,     0);
+    svm_ctrl_write32(vmcb, VMCB_CTRL_EVENT_INJ,   0);
     svm_ctrl_write32(vmcb, VMCB_CTRL_EVENT_INJ_ERR, 0);
 
     //
-    // nested paging (shared identity map built by ept_init)
+    // nested paging (shared x86-64 NPT table built by ept_init)
     //
-    if (g_ept->npt_supported)
-    {
-        svm_ctrl_write(vmcb, VMCB_CTRL_MISC_CTL, SVM_MISC_ENABLE_NP);
-        svm_ctrl_write(vmcb, VMCB_CTRL_NESTED_CR3, ept_pml4_pa());
-    }
-    else
-    {
-        DbgPrintEx(0, 0, "[hv] svm: NPT not available, running without nested paging\n");
-    }
+    svm_ctrl_write(vmcb, VMCB_CTRL_MISC_CTL,   SVM_MISC_ENABLE_NP);
+    svm_ctrl_write(vmcb, VMCB_CTRL_NESTED_CR3, ept_pml4_pa());
 
     //
-    // guest state = current CPU state (type-2: we virtualize the running OS)
+    // enable SVM on this logical processor and register HSAVE PA BEFORE VMSAVE
+    //
+    asm_svm_enable();
+    __writemsr(MSR_VM_HSAVE_PA, vcpu->hsave_pa);
+
+    //
+    // capture hidden segment/syscall state (FS/GS/TR/LDTR/KernelGsBase/STAR/
+    // LSTAR/CSTAR/SFMASK/SYSENTER_*) into both guest VMCB and host VMCB!
+    //
+    asm_svm_vmsave(vcpu->vmcb_pa);
+    asm_svm_vmsave(vcpu->svm_host_vmcb_pa);
+
+    //
+    // populate guest visible architectural state in VMCB save area
     //
     gdt_base = asm_get_gdt_base();
-    svm_fill_segment(vmcb, &vmcb->Save.Es,   gdt_base, asm_get_es());
-    svm_fill_segment(vmcb, &vmcb->Save.Cs,   gdt_base, asm_get_cs());
-    svm_fill_segment(vmcb, &vmcb->Save.Ss,   gdt_base, asm_get_ss());
-    svm_fill_segment(vmcb, &vmcb->Save.Ds,   gdt_base, asm_get_ds());
-    svm_fill_segment(vmcb, &vmcb->Save.Fs,   gdt_base, asm_get_fs());
-    svm_fill_segment(vmcb, &vmcb->Save.Gs,   gdt_base, asm_get_gs());
-    svm_fill_segment(vmcb, &vmcb->Save.Ldtr, gdt_base, asm_get_ldtr());
-    svm_fill_segment(vmcb, &vmcb->Save.Tr,   gdt_base, asm_get_tr());
+    vcpu->original_idt_base  = asm_get_idt_base();
+    vcpu->original_idt_limit = asm_get_idt_limit();
+
+#if USE_PRIVATE_HOST_GDT
+    hostgdt_populate_for_vcpu(vcpu);
+#else
+    vcpu->original_gdt_base    = gdt_base;
+    vcpu->original_gdt_limit   = asm_get_gdt_limit();
+    vcpu->original_tr_selector = asm_get_tr();
+#endif
+
+    svm_fill_segment(&vmcb->Save.Es, gdt_base, asm_get_es());
+    svm_fill_segment(&vmcb->Save.Cs, gdt_base, asm_get_cs());
+    svm_fill_segment(&vmcb->Save.Ss, gdt_base, asm_get_ss());
+    svm_fill_segment(&vmcb->Save.Ds, gdt_base, asm_get_ds());
 
     vmcb->Save.Gdtr.Selector = 0;
     vmcb->Save.Gdtr.Attrib   = 0;
@@ -612,13 +525,16 @@ svm_virtualize_cpu(PVOID guest_stack)
 
     vmcb->Save.Idtr.Selector = 0;
     vmcb->Save.Idtr.Attrib   = 0;
-    vmcb->Save.Idtr.Limit    = asm_get_idt_limit();
-    vmcb->Save.Idtr.Base     = asm_get_idt_base();
+    vmcb->Save.Idtr.Limit    = vcpu->original_idt_limit;
+    vmcb->Save.Idtr.Base     = vcpu->original_idt_base;
 
     vmcb->Save.Cr0    = __readcr0();
     vmcb->Save.Cr3    = __readcr3();
     vmcb->Save.Cr4    = __readcr4();
-    vmcb->Save.Efer   = __readmsr(MSR_EFER) & ~EFER_SVME;   // hide SVME from guest
+    vmcb->Save.Dr6    = __readdr(6);
+    vmcb->Save.Dr7    = __readdr(7);
+    vmcb->Save.Efer   = __readmsr(MSR_EFER) | EFER_SVME;    // VMRUN requires SVME=1!
+    vmcb->Save.GPat   = __readmsr(IA32_PAT);                // required for NPT caching!
     vmcb->Save.Rflags = asm_get_rflags();
     vmcb->Save.Rip    = (UINT64)asm_svm_restore_state;
     vmcb->Save.Rsp    = (UINT64)guest_stack;
@@ -626,82 +542,40 @@ svm_virtualize_cpu(PVOID guest_stack)
     vmcb->Save.Cpl    = 0;
 
     //
-    // host save area (HSAVE) — loaded by the CPU on every #VMEXIT
+    // VMM stack top slots (H = stack_top - 0x30):
+    //   [top - 0x08] = vcpu
+    //   [top - 0x10] = guest_vmcb_pa
+    //   [top - 0x18] = host_nmi_pending (0)
+    //   [top - 0x20] = host_vmcb_pa
     //
-    {
-        PSVM_HOST_SAVE_AREA hs = (PSVM_HOST_SAVE_AREA)vcpu->hsave_va;
-        PSVM_SEGMENT hseg;
+    UINT64 stack_top = vcpu->vmm_stack + VMM_STACK_SIZE;
+    *(PVIRTUAL_MACHINE_STATE *)(stack_top - VMM_STACK_VCPU_OFFSET) = vcpu;
+    *(UINT64 *)(stack_top - VMM_STACK_VMCB_OFFSET)                 = vcpu->vmcb_pa;
+    *(UINT64 *)(stack_top - VMM_STACK_NMI_OFFSET)                  = 0;
+    *(UINT64 *)(stack_top - VMM_STACK_RSP_OFFSET)                  = vcpu->svm_host_vmcb_pa;
 
-        RtlZeroMemory(hs, PAGE_SIZE);
+    UINT64 host_cr3  = 0;
+    UINT64 host_idtr = 0;
 
-        hseg = (PSVM_SEGMENT)((PUINT8)hs + SVM_HSAVE_OFF_ES);
-        hseg->Selector = asm_get_es();
-        hseg = (PSVM_SEGMENT)((PUINT8)hs + SVM_HSAVE_OFF_CS);
-        hseg->Selector = asm_get_cs();
-        {
-            VMX_SEGMENT_SELECTOR seg = {0};
-            segment_get_descriptor((PUCHAR)gdt_base, asm_get_cs(), &seg);
-            hseg->Attrib = (UINT16)(seg.Attributes.AsUInt & 0xFFFF);
-        }
-        hseg = (PSVM_SEGMENT)((PUINT8)hs + SVM_HSAVE_OFF_SS);
-        hseg->Selector = asm_get_ss();
-        {
-            VMX_SEGMENT_SELECTOR seg = {0};
-            segment_get_descriptor((PUCHAR)gdt_base, asm_get_ss(), &seg);
-            hseg->Attrib = (UINT16)(seg.Attributes.AsUInt & 0xFFFF);
-        }
-        hseg = (PSVM_SEGMENT)((PUINT8)hs + SVM_HSAVE_OFF_DS);
-        hseg->Selector = asm_get_ds();
-
-        hseg = (PSVM_SEGMENT)((PUINT8)hs + SVM_HSAVE_OFF_GDTR);
-        hseg->Base  = gdt_base;
-        hseg->Limit = asm_get_gdt_limit();
-
-        hseg = (PSVM_SEGMENT)((PUINT8)hs + SVM_HSAVE_OFF_IDTR);
-#if USE_PRIVATE_HOST_IDT
-        if (g_host_idt.initialized)
-            hseg->Base = hostidt_get_base();
-        else
-#endif
-            hseg->Base = asm_get_idt_base();
-        hseg->Limit = asm_get_idt_limit();
-
-        *(UINT64 *)((PUINT8)hs + SVM_HSAVE_OFF_EFER)   = __readmsr(MSR_EFER) | EFER_SVME;
-        *(UINT64 *)((PUINT8)hs + SVM_HSAVE_OFF_CR0)    = __readcr0();
 #if USE_PRIVATE_HOST_CR3
-        *(UINT64 *)((PUINT8)hs + SVM_HSAVE_OFF_CR3)    = hostcr3_get();
-#else
-        *(UINT64 *)((PUINT8)hs + SVM_HSAVE_OFF_CR3)    = __readcr3();
+    host_cr3 = hostcr3_get();
 #endif
-        *(UINT64 *)((PUINT8)hs + SVM_HSAVE_OFF_CR4)    = __readcr4();
-        *(UINT64 *)((PUINT8)hs + SVM_HSAVE_OFF_RFLAGS) = asm_get_rflags();
-        *(UINT64 *)((PUINT8)hs + SVM_HSAVE_OFF_RIP)    = (UINT64)asm_svmexit_handler;
-        *(UINT64 *)((PUINT8)hs + SVM_HSAVE_OFF_RSP)    = vcpu->vmm_stack + VMM_STACK_SIZE - 16;
-        *(UINT64 *)((PUINT8)hs + SVM_HSAVE_OFF_RAX)    = 0;
-    }
-
-    //
-    // vmm stack top: [HOST_RSP+0] = vmcb_pa (for VMRUN), [HOST_RSP+8] = vcpu
-    //
-    *(UINT64 *)(vcpu->vmm_stack + VMM_STACK_SIZE - 16) = vcpu->vmcb_pa;
-    *(PVIRTUAL_MACHINE_STATE *)(vcpu->vmm_stack + VMM_STACK_SIZE - VMM_STACK_VCPU_OFFSET) = vcpu;
-
-    //
-    // per-cpu SVM enable: HSAVE PA + EFER.SVME, then VMRUN
-    //
-    __writemsr(MSR_VM_HSAVE_PA, vcpu->hsave_pa);
-    asm_svm_enable();
+#if USE_PRIVATE_HOST_IDT
+    if (g_host_idt.initialized)
+        host_idtr = hostidt_get_base();
+#endif
 
     vcpu->launched = TRUE;
 
-    asm_svm_vmrun(vcpu->vmcb_pa);
+    //
+    // enters host VMLOAD/VMRUN/VMSAVE loop; guest resumes at asm_svm_restore_state
+    //
+    asm_svm_launch_loop(vcpu, stack_top, host_cr3, host_idtr);
 
     //
-    // reaching here means VMRUN failed (it never returns on success)
+    // unreachable
     //
-    vcpu->launched = FALSE;
-    DbgPrintEx(0, 0, "[hv] svm: VMRUN failed on cpu %u\n", idx);
-    return FALSE;
+    return TRUE;
 }
 
 VOID
@@ -710,73 +584,101 @@ svm_terminate_cpu(VOID)
     asm_svm_vmcall(VMCALL_VMXOFF, 0, 0, 0);
 }
 
+static BOOLEAN
+svm_alloc_vcpu_resources(VIRTUAL_MACHINE_STATE * vcpu)
+{
+    vcpu->vmm_stack = (UINT64)hv_alloc_aligned_contiguous(
+        VMM_STACK_SIZE, VMM_STACK_SIZE, &vcpu->vmm_stack_raw);
+    if (!vcpu->vmm_stack)
+        return FALSE;
+    RtlZeroMemory((PVOID)vcpu->vmm_stack, VMM_STACK_SIZE);
+
+    vcpu->vmcb_va = (UINT64)hv_alloc_contiguous(VMCB_SIZE);
+    if (!vcpu->vmcb_va)
+        return FALSE;
+    RtlZeroMemory((PVOID)vcpu->vmcb_va, VMCB_SIZE);
+    vcpu->vmcb_pa = va_to_pa((PVOID)vcpu->vmcb_va);
+
+    vcpu->hsave_va = (UINT64)hv_alloc_contiguous(PAGE_SIZE);
+    if (!vcpu->hsave_va)
+        return FALSE;
+    RtlZeroMemory((PVOID)vcpu->hsave_va, PAGE_SIZE);
+    vcpu->hsave_pa = va_to_pa((PVOID)vcpu->hsave_va);
+
+    vcpu->svm_host_vmcb_va = (UINT64)hv_alloc_contiguous(PAGE_SIZE);
+    if (!vcpu->svm_host_vmcb_va)
+        return FALSE;
+    RtlZeroMemory((PVOID)vcpu->svm_host_vmcb_va, PAGE_SIZE);
+    vcpu->svm_host_vmcb_pa = va_to_pa((PVOID)vcpu->svm_host_vmcb_va);
+
+    vcpu->iopm_va = (UINT64)hv_alloc_contiguous(IOPM_SIZE);
+    if (!vcpu->iopm_va)
+        return FALSE;
+    RtlZeroMemory((PVOID)vcpu->iopm_va, IOPM_SIZE);
+    vcpu->iopm_pa = va_to_pa((PVOID)vcpu->iopm_va);
+
+    vcpu->msrpm_va = (UINT64)hv_alloc_contiguous(MSRPM_SIZE);
+    if (!vcpu->msrpm_va)
+        return FALSE;
+    RtlZeroMemory((PVOID)vcpu->msrpm_va, MSRPM_SIZE);
+
+    //
+    // program MSRPM intercepts so guest RDMSR/WRMSR of sensitive MSRs trap!
+    //
+    PUINT8 msrpm = (PUINT8)vcpu->msrpm_va;
+    svm_set_msrpm_bit(msrpm, 0x10U,               TRUE,  FALSE); // IA32_TIME_STAMP_COUNTER
+    svm_set_msrpm_bit(msrpm, MSR_EFER,            TRUE,  TRUE);  // hide EFER.SVME
+    svm_set_msrpm_bit(msrpm, MSR_VM_CR,           TRUE,  TRUE);  // #GP on guest access
+    svm_set_msrpm_bit(msrpm, MSR_VM_HSAVE_PA,     TRUE,  TRUE);  // #GP on guest access
+    svm_set_msrpm_bit(msrpm, IA32_FEATURE_CONTROL, TRUE, TRUE);  // #GP on AMD
+    for (UINT32 m = IA32_VMX_BASIC; m <= 0x493U; m++)
+        svm_set_msrpm_bit(msrpm, m, TRUE, TRUE);
+
+    vcpu->msrpm_pa = va_to_pa((PVOID)vcpu->msrpm_va);
+
+#if USE_PRIVATE_HOST_GDT
+    if (!hostgdt_alloc_for_vcpu(vcpu))
+        return FALSE;
+#endif
+
+    vcpu->npt_cr3         = ept_pml4_pa();
+    vcpu->min_exit_cycles = MAXULONG64;
+    return TRUE;
+}
+
 BOOLEAN
 svm_init(VOID)
 {
-    g_cpu_count = hv_total_processor_count();
-    if (!g_cpu_count)
+    g_cpu_count     = hv_total_processor_count();
+    g_vcpu_capacity = hv_max_processor_count();
+    if (!g_cpu_count || !g_vcpu_capacity)
         return FALSE;
 
-    g_vcpu = (VIRTUAL_MACHINE_STATE *)hv_pool_alloc(sizeof(VIRTUAL_MACHINE_STATE) * g_cpu_count);
+    g_vcpu = (VIRTUAL_MACHINE_STATE *)hv_pool_alloc(sizeof(VIRTUAL_MACHINE_STATE) * g_vcpu_capacity);
     if (!g_vcpu)
         return FALSE;
-    RtlZeroMemory(g_vcpu, sizeof(VIRTUAL_MACHINE_STATE) * g_cpu_count);
+    RtlZeroMemory(g_vcpu, sizeof(VIRTUAL_MACHINE_STATE) * g_vcpu_capacity);
 
     if (!svm_check_support())
+        return FALSE;
+
+    if (!logbuf_init())
         return FALSE;
 
 #if STEALTH_CPUID_CACHING
     stealth_init_cpuid_cache();
 #endif
 
-    //
-    // shared identity-mapped NPT (same page-table format as EPT)
-    //
     if (!ept_init())
     {
-        DbgPrintEx(0, 0, "[hv] svm: NPT/EPT init failed\n");
+        HV_LOG("svm: NPT init failed\n");
         return FALSE;
     }
 
-    for (UINT32 i = 0; i < g_cpu_count; i++)
+    for (UINT32 i = 0; i < g_vcpu_capacity; i++)
     {
-        VIRTUAL_MACHINE_STATE * vcpu = &g_vcpu[i];
-
-        //
-        // contiguous (page-aligned) so HSAVE.rsp is guaranteed 16-byte
-        // aligned — the asm exit handler's call alignment depends on it
-        //
-        vcpu->vmm_stack = (UINT64)hv_alloc_contiguous(VMM_STACK_SIZE);
-        if (!vcpu->vmm_stack)
+        if (!svm_alloc_vcpu_resources(&g_vcpu[i]))
             return FALSE;
-        RtlZeroMemory((PVOID)vcpu->vmm_stack, VMM_STACK_SIZE);
-
-        vcpu->vmcb_va = (UINT64)hv_alloc_contiguous(VMCB_SIZE);
-        if (!vcpu->vmcb_va)
-            return FALSE;
-        vcpu->vmcb_pa = va_to_pa((PVOID)vcpu->vmcb_va);
-
-        vcpu->hsave_va = (UINT64)hv_alloc_contiguous(PAGE_SIZE);
-        if (!vcpu->hsave_va)
-            return FALSE;
-        vcpu->hsave_pa = va_to_pa((PVOID)vcpu->hsave_va);
-
-        vcpu->iopm_va = (UINT64)hv_alloc_contiguous(IOPM_SIZE);
-        if (!vcpu->iopm_va)
-            return FALSE;
-        RtlZeroMemory((PVOID)vcpu->iopm_va, IOPM_SIZE);   // all-zero = no IO exits
-        vcpu->iopm_pa = va_to_pa((PVOID)vcpu->iopm_va);
-
-        vcpu->msrpm_va = (UINT64)hv_alloc_contiguous(0x2000);
-        if (!vcpu->msrpm_va)
-            return FALSE;
-        RtlZeroMemory((PVOID)vcpu->msrpm_va, 0x2000);
-        vcpu->msrpm_pa = va_to_pa((PVOID)vcpu->msrpm_va);
-
-        //
-        // shared NPT pointer
-        //
-        vcpu->npt_cr3 = ept_pml4_pa();
     }
 
 #if USE_PRIVATE_HOST_CR3
@@ -795,12 +697,13 @@ svm_init(VOID)
     {
         if (!g_vcpu[i].launched)
         {
-            DbgPrintEx(0, 0, "[hv] svm: cpu %u failed to launch\n", i);
+            HV_LOG("svm: cpu %u failed to launch, rolling back...\n", i);
+            broadcast_terminate_all();
             return FALSE;
         }
     }
 
-    DbgPrintEx(0, 0, "[hv] SVM: all %u logical processors virtualized\n", g_cpu_count);
+    HV_LOG("SVM: all %u logical processors virtualized (capacity=%u)\n", g_cpu_count, g_vcpu_capacity);
     return TRUE;
 }
 
@@ -810,7 +713,7 @@ svm_terminate(VOID)
     if (!g_vcpu)
         return;
 
-    for (UINT32 i = 0; i < g_cpu_count; i++)
+    for (UINT32 i = 0; i < g_vcpu_capacity; i++)
     {
         VIRTUAL_MACHINE_STATE * vcpu = &g_vcpu[i];
 
@@ -818,12 +721,14 @@ svm_terminate(VOID)
             hv_free_contiguous((PVOID)vcpu->vmcb_va);
         if (vcpu->hsave_va)
             hv_free_contiguous((PVOID)vcpu->hsave_va);
+        if (vcpu->svm_host_vmcb_va)
+            hv_free_contiguous((PVOID)vcpu->svm_host_vmcb_va);
         if (vcpu->iopm_va)
             hv_free_contiguous((PVOID)vcpu->iopm_va);
         if (vcpu->msrpm_va)
             hv_free_contiguous((PVOID)vcpu->msrpm_va);
-        if (vcpu->vmm_stack)
-            hv_free_contiguous((PVOID)vcpu->vmm_stack);
+        if (vcpu->vmm_stack_raw)
+            hv_free_contiguous(vcpu->vmm_stack_raw);
 
 #if USE_PRIVATE_HOST_GDT
         hostgdt_destroy_for_vcpu(vcpu);
@@ -840,10 +745,13 @@ svm_terminate(VOID)
     hostidt_destroy();
 #endif
 
-    hv_pool_free(g_vcpu);
-    g_vcpu = NULL;
+    logbuf_destroy();
 
-    DbgPrintEx(0, 0, "[hv] SVM terminated on all processors.\n");
+    hv_pool_free(g_vcpu);
+    g_vcpu          = NULL;
+    g_vcpu_capacity = 0;
+
+    HV_LOG("SVM terminated on all processors.\n");
 }
 
 const HV_BACKEND g_svm_backend = {
