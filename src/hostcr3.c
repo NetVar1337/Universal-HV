@@ -1,270 +1,249 @@
 /*
-*   hostcr3.c - private host page tables for vmx host mode
+*   hostcr3.c - minimal, race-free private host page tables (4-level & LA57)
 *
-*   deep-copies kernel portion of system page tables to create an isolated
-*   cr3 for vmx host mode. protects the hypervisor from guest-mode page
-*   table modifications (eg. anti-cheat drivers that unmap/corrupt kernel ptes)
+*   instead of walking and deep-copying live Windows kernel page tables
+*   (which races with the memory manager, consumes up to 64MB, and breaks on
+*   LA57 5-level paging), this module builds a dedicated minimal host page
+*   table mapping ONLY the exact virtual ranges accessed in VMX-root / SVM
+*   host mode:
+*     - the Ophion driver image (code + data + g_host_idt + globals)
+*     - g_vcpu array
+*     - g_ept, VMM_EPT_PAGE_TABLE, and all EPT/NPT + DynPool pages
+*     - per-vCPU VMM stacks, private host GDTs, VMCBs, HSAVEs, bitmaps
 *
-*   strategy:
-*     1. read system process pml4 (stable kernel cr3)
-*     2. allocate our own pml4 -> pdpt -> pd -> pt hierarchy
-*     3. copy kernel-space entries (pml4[256..511]), deep-copying every level
-*     4. leaf entries still point to same physical pages — isolation is
-*        at the page table level only
-*     5. set VMCS_HOST_CR3 to our private pml4 physical address
+*   all page-table pages are allocated via hv_alloc_contiguous(PAGE_SIZE)
+*   so they are strictly 4KB physically aligned even under Driver Verifier.
 */
 #include "hv.h"
 
-#define PTE_PRESENT     (1ULL << 0)
-#define PTE_LARGE_PAGE  (1ULL << 7)
-#define PTE_PFN_MASK    0x000FFFFFFFFFF000ULL
+#define HOST_PTE_PRESENT    (1ULL << 0)
+#define HOST_PTE_WRITE      (1ULL << 1)
+#define HOST_PTE_NX         (1ULL << 63)
+#define HOST_PTE_PFN_MASK   0x000FFFFFFFFFF000ULL
 
-//
-// deep-copying the kernel half of the system page tables can take many
-// pages on machines with lots of RAM / large kernel VA usage; 16K pages
-// (64MB of page tables) is a generous ceiling for any shipping machine.
-//
-#define MAX_HOST_PT_PAGES 16384
+#define MAX_HOST_PT_PAGES   1024
 
-static PVOID   g_host_pt_pages[MAX_HOST_PT_PAGES];
-static UINT32  g_host_pt_count = 0;
-static PUINT64 g_host_pml4_va  = NULL;
-static UINT64  g_host_pml4_pa  = 0;
+typedef struct _HOST_PT_PAGE {
+    PUINT64 Va;
+    UINT64  Pa;
+} HOST_PT_PAGE;
 
-static PVOID
-host_alloc_page(VOID)
+static HOST_PT_PAGE g_host_pt_pages[MAX_HOST_PT_PAGES];
+static UINT32       g_host_pt_count  = 0;
+static PUINT64      g_host_root_va   = NULL;
+static UINT64       g_host_root_pa   = 0;
+static BOOLEAN      g_host_la57      = FALSE;
+
+static PUINT64
+host_alloc_table(UINT64 *pa_out)
 {
-    PVOID page = hv_pool_alloc(PAGE_SIZE);
+    if (g_host_pt_count >= MAX_HOST_PT_PAGES)
+        return NULL;
+
+    PVOID page = hv_alloc_contiguous(PAGE_SIZE);
     if (!page)
         return NULL;
 
     RtlZeroMemory(page, PAGE_SIZE);
+    UINT64 pa = va_to_pa(page);
 
-    if (g_host_pt_count < MAX_HOST_PT_PAGES)
-        g_host_pt_pages[g_host_pt_count++] = page;
-    else
+    g_host_pt_pages[g_host_pt_count].Va = (PUINT64)page;
+    g_host_pt_pages[g_host_pt_count].Pa = pa;
+    g_host_pt_count++;
+
+    if (pa_out)
+        *pa_out = pa;
+    return (PUINT64)page;
+}
+
+static PUINT64
+host_find_table_va(UINT64 pa)
+{
+    UINT64 target = pa & HOST_PTE_PFN_MASK;
+    for (UINT32 i = 0; i < g_host_pt_count; i++)
     {
-        //
-        // out of tracking slots: leak-safe fallback is to keep the page but
-        // stop tracking (freed at unload by count)... instead fail cleanly.
-        //
-        hv_pool_free(page);
+        if (g_host_pt_pages[i].Pa == target)
+            return g_host_pt_pages[i].Va;
+    }
+    return NULL;
+}
+
+static PUINT64
+host_ensure_child(PUINT64 table, UINT32 index)
+{
+    if (table[index] & HOST_PTE_PRESENT)
+        return host_find_table_va(table[index]);
+
+    UINT64  child_pa = 0;
+    PUINT64 child_va = host_alloc_table(&child_pa);
+    if (!child_va)
         return NULL;
+
+    table[index] = HOST_PTE_PRESENT | HOST_PTE_WRITE | (child_pa & HOST_PTE_PFN_MASK);
+    return child_va;
+}
+
+static BOOLEAN
+hostcr3_map_page(UINT64 va, UINT64 pa, BOOLEAN executable)
+{
+    PUINT64 pml4 = g_host_root_va;
+
+    if (g_host_la57)
+    {
+        UINT32 pml5_idx = (UINT32)((va >> 48) & 0x1FFU);
+        pml4 = host_ensure_child(g_host_root_va, pml5_idx);
+        if (!pml4)
+            return FALSE;
     }
 
-    return page;
+    UINT32 pml4_idx = (UINT32)((va >> 39) & 0x1FFU);
+    UINT32 pdpt_idx = (UINT32)((va >> 30) & 0x1FFU);
+    UINT32 pd_idx   = (UINT32)((va >> 21) & 0x1FFU);
+    UINT32 pt_idx   = (UINT32)((va >> 12) & 0x1FFU);
+
+    PUINT64 pdpt = host_ensure_child(pml4, pml4_idx);
+    if (!pdpt)
+        return FALSE;
+
+    PUINT64 pd = host_ensure_child(pdpt, pdpt_idx);
+    if (!pd)
+        return FALSE;
+
+    PUINT64 pt = host_ensure_child(pd, pd_idx);
+    if (!pt)
+        return FALSE;
+
+    UINT64 flags = HOST_PTE_PRESENT | HOST_PTE_WRITE;
+    if (!executable)
+        flags |= HOST_PTE_NX;
+
+    //
+    // if a page is mapped twice (e.g. adjacent allocations sharing a 4KB page),
+    // preserve executable permission if either mapping requires it.
+    //
+    if ((pt[pt_idx] & HOST_PTE_PRESENT) && !(pt[pt_idx] & HOST_PTE_NX))
+        flags &= ~HOST_PTE_NX;
+
+    pt[pt_idx] = flags | (pa & HOST_PTE_PFN_MASK);
+    return TRUE;
 }
 
-//
-// map a physical page via MmGetVirtualForPhysical
-// returns existing kernel va for any pfn-tracked ram page
-// unlike MmMapIoSpace, never fails for regular ram and needs no unmap
-//
-static PUINT64
-host_map_phys(UINT64 pa)
+BOOLEAN
+hostcr3_init(VOID)
 {
-    PHYSICAL_ADDRESS phys;
-    phys.QuadPart = (LONGLONG)(pa & ~0xFFFULL);
-    return (PUINT64)MmGetVirtualForPhysical(phys);
+    hostcr3_destroy();
+
+    g_host_la57 = (__readcr4() & CR4_LA57_FLAG) ? TRUE : FALSE;
+
+    g_host_root_va = host_alloc_table(&g_host_root_pa);
+    if (!g_host_root_va)
+        return FALSE;
+
+    return TRUE;
 }
 
-//
-// deep-copy a single pt (level 1) — 512 leaf 4kb entries
-// leaf entries copied as-is (same physical pages)
-//
-static PUINT64
-host_clone_pt(PUINT64 orig_pt)
+BOOLEAN
+hostcr3_map_range(PVOID va, SIZE_T size, BOOLEAN executable)
 {
-    PUINT64 our_pt = (PUINT64)host_alloc_page();
-    if (!our_pt)
-        return NULL;
+    if (!va || size == 0 || !g_host_root_va)
+        return TRUE;
 
-    RtlCopyMemory(our_pt, orig_pt, PAGE_SIZE);
-    return our_pt;
-}
+    UINT64 start = ((UINT64)(ULONG_PTR)va) & ~0xFFFULL;
+    UINT64 end   = (((UINT64)(ULONG_PTR)va + size - 1ULL) & ~0xFFFULL);
 
-//
-// deep-copy a pd (level 2) — 512 entries, each either a 2mb large page
-// (copied as-is) or a pointer to a pt (deep-copied)
-//
-static PUINT64
-host_clone_pd(PUINT64 orig_pd)
-{
-    PUINT64 our_pd = (PUINT64)host_alloc_page();
-    if (!our_pd)
-        return NULL;
-
-    for (UINT32 k = 0; k < 512; k++)
+    for (UINT64 cur = start; cur <= end; cur += PAGE_SIZE)
     {
-        if (!(orig_pd[k] & PTE_PRESENT))
-        {
-            our_pd[k] = 0;
-            continue;
-        }
+        UINT64 pa = va_to_pa((PVOID)(ULONG_PTR)cur);
+        if (!pa)
+            continue; // skip discarded/unmapped pages (e.g. INIT section)
 
-        if (orig_pd[k] & PTE_LARGE_PAGE)
-        {
-            our_pd[k] = orig_pd[k];
-            continue;
-        }
+        if (!hostcr3_map_page(cur, pa, executable))
+            return FALSE;
 
-        UINT64  orig_pt_pa = orig_pd[k] & PTE_PFN_MASK;
-        PUINT64 orig_pt    = host_map_phys(orig_pt_pa);
-        if (!orig_pt)
-        {
-            our_pd[k] = orig_pd[k];
-            continue;
-        }
-
-        PUINT64 our_pt = host_clone_pt(orig_pt);
-        if (!our_pt)
-        {
-            our_pd[k] = orig_pd[k];
-            continue;
-        }
-
-        our_pd[k] = (orig_pd[k] & ~PTE_PFN_MASK) | va_to_pa(our_pt);
+        if (cur == ~0xFFFULL)
+            break;
     }
 
-    return our_pd;
+    return TRUE;
 }
 
-//
-// deep-copy a pdpt (level 3) — 512 entries, each either a 1gb large page
-// (copied as-is) or a pointer to a pd (deep-copied)
-//
-static PUINT64
-host_clone_pdpt(PUINT64 orig_pdpt)
-{
-    PUINT64 our_pdpt = (PUINT64)host_alloc_page();
-    if (!our_pdpt)
-        return NULL;
-
-    for (UINT32 j = 0; j < 512; j++)
-    {
-        if (!(orig_pdpt[j] & PTE_PRESENT))
-        {
-            our_pdpt[j] = 0;
-            continue;
-        }
-
-        if (orig_pdpt[j] & PTE_LARGE_PAGE)
-        {
-            our_pdpt[j] = orig_pdpt[j];
-            continue;
-        }
-
-        UINT64  orig_pd_pa = orig_pdpt[j] & PTE_PFN_MASK;
-        PUINT64 orig_pd    = host_map_phys(orig_pd_pa);
-        if (!orig_pd)
-        {
-            our_pdpt[j] = orig_pdpt[j];
-            continue;
-        }
-
-        PUINT64 our_pd = host_clone_pd(orig_pd);
-        if (!our_pd)
-        {
-            our_pdpt[j] = orig_pdpt[j];
-            continue;
-        }
-
-        our_pdpt[j] = (orig_pdpt[j] & ~PTE_PFN_MASK) | va_to_pa(our_pd);
-    }
-
-    return our_pdpt;
-}
-
-/*
-*   build private host page tables by deep-copying kernel pml4 entries
-*   must be called after all host-mode allocations (vmm stacks, bitmaps, etc)
-*/
 BOOLEAN
 hostcr3_build(VOID)
 {
-    UINT64 sys_cr3 = get_system_cr3();
-    UINT64 pml4_pa = sys_cr3 & PTE_PFN_MASK;
-
-    PUINT64 orig_pml4 = host_map_phys(pml4_pa);
-    if (!orig_pml4)
-    {
-        DbgPrintEx(0, 0, "[hv] hostcr3: failed to map PML4 at PA 0x%llx\n", pml4_pa);
-        return FALSE;
-    }
-
-    PUINT64 our_pml4 = (PUINT64)host_alloc_page();
-    if (!our_pml4)
+    if (!hostcr3_init())
         return FALSE;
 
     //
-    // zero user-space entries (never run user code in host mode)
+    // 1. map the entire driver image (code + .rdata + .data + g_host_idt + globals)
     //
-    for (UINT32 i = 0; i < 256; i++)
-        our_pml4[i] = 0;
-
-    for (UINT32 i = 256; i < 512; i++)
+    if (g_driver_base && g_driver_size)
     {
-        if (!(orig_pml4[i] & PTE_PRESENT))
-        {
-            our_pml4[i] = 0;
-            continue;
-        }
-
-        //
-        // skip self-referencing entry — windows uses one pml4 entry that
-        // points back to the pml4 itself for page table self-mapping.
-        // fix it up after building our pml4
-        //
-        if ((orig_pml4[i] & PTE_PFN_MASK) == pml4_pa)
-        {
-            our_pml4[i] = orig_pml4[i];
-            continue;
-        }
-
-        UINT64  orig_pdpt_pa = orig_pml4[i] & PTE_PFN_MASK;
-        PUINT64 orig_pdpt    = host_map_phys(orig_pdpt_pa);
-        if (!orig_pdpt)
-        {
-            our_pml4[i] = orig_pml4[i];
-            continue;
-        }
-
-        PUINT64 our_pdpt = host_clone_pdpt(orig_pdpt);
-        if (!our_pdpt)
-        {
-            our_pml4[i] = orig_pml4[i];
-            continue;
-        }
-
-        our_pml4[i] = (orig_pml4[i] & ~PTE_PFN_MASK) | va_to_pa(our_pdpt);
+        if (!hostcr3_map_range(g_driver_base, g_driver_size, TRUE))
+            goto fail;
     }
 
-    g_host_pml4_va = our_pml4;
-    g_host_pml4_pa = va_to_pa(our_pml4);
-
     //
-    // fix self-referencing pml4 entry to point to our pml4
+    // 2. map g_vcpu array and all per-vCPU host-mode buffers
     //
-    for (UINT32 i = 256; i < 512; i++)
+    if (g_vcpu && g_vcpu_capacity)
     {
-        if ((our_pml4[i] & PTE_PRESENT) &&
-            ((our_pml4[i] & PTE_PFN_MASK) == pml4_pa))
+        if (!hostcr3_map_range(g_vcpu, sizeof(VIRTUAL_MACHINE_STATE) * g_vcpu_capacity, FALSE))
+            goto fail;
+
+        for (UINT32 i = 0; i < g_cpu_count; i++)
         {
-            our_pml4[i] = (our_pml4[i] & ~PTE_PFN_MASK) | g_host_pml4_pa;
-            break;
+            VIRTUAL_MACHINE_STATE *vcpu = &g_vcpu[i];
+
+            if (vcpu->vmm_stack &&
+                !hostcr3_map_range((PVOID)vcpu->vmm_stack, VMM_STACK_SIZE, FALSE))
+                goto fail;
+
+            if (vcpu->host_gdt &&
+                !hostcr3_map_range(vcpu->host_gdt, PAGE_SIZE, FALSE))
+                goto fail;
+
+            if (vcpu->vmcb_va &&
+                !hostcr3_map_range((PVOID)vcpu->vmcb_va, VMCB_SIZE, FALSE))
+                goto fail;
+
+            if (vcpu->hsave_va &&
+                !hostcr3_map_range((PVOID)vcpu->hsave_va, PAGE_SIZE, FALSE))
+                goto fail;
+
+            if (vcpu->svm_host_vmcb_va &&
+                !hostcr3_map_range((PVOID)vcpu->svm_host_vmcb_va, PAGE_SIZE, FALSE))
+                goto fail;
+
+            if (vcpu->msr_bitmap_va &&
+                !hostcr3_map_range((PVOID)vcpu->msr_bitmap_va, PAGE_SIZE, FALSE))
+                goto fail;
+
+            if (vcpu->msrpm_va &&
+                !hostcr3_map_range((PVOID)vcpu->msrpm_va, MSRPM_SIZE, FALSE))
+                goto fail;
         }
     }
 
-    DbgPrintEx(0, 0, "[hv] Private host CR3 built: PA=0x%llx (%u pages allocated)\n",
-               g_host_pml4_pa, g_host_pt_count);
+    //
+    // 3. map EPT/NPT state + page tables + DynPool (accessed during root-mode
+    //    EPT violation / NPF dynamic MMIO mapping)
+    //
+    if (!ept_map_into_hostcr3())
+        goto fail;
 
+    HV_LOG("Minimal private host CR3 built: PA=0x%llx (%u pages, %s)\n",
+           g_host_root_pa, g_host_pt_count, g_host_la57 ? "LA57 5-level" : "4-level");
     return TRUE;
+
+fail:
+    hostcr3_destroy();
+    return FALSE;
 }
 
 UINT64
 hostcr3_get(VOID)
 {
-    return g_host_pml4_pa;
+    return g_host_root_pa;
 }
 
 VOID
@@ -272,11 +251,12 @@ hostcr3_destroy(VOID)
 {
     for (UINT32 i = 0; i < g_host_pt_count; i++)
     {
-        if (g_host_pt_pages[i])
-            hv_pool_free(g_host_pt_pages[i]);
+        if (g_host_pt_pages[i].Va)
+            hv_free_contiguous(g_host_pt_pages[i].Va);
     }
 
     g_host_pt_count = 0;
-    g_host_pml4_va  = NULL;
-    g_host_pml4_pa  = 0;
+    g_host_root_va  = NULL;
+    g_host_root_pa  = 0;
+    g_host_la57     = FALSE;
 }

@@ -1,14 +1,12 @@
 /*
-*   hostidt.c - private host IDT for VMX-root mode
+*   hostidt.c - private host IDT for VMX-root / SVM host mode
 *   prevents NMI hijacking where guest corrupts OS IDT and triggers
-*   NMI while in host mode to execute attacker code in ring 0
+*   NMI while in host mode to execute attacker code in ring 0.
+*
+*   NOTE: original per-core IDTR base/limit are stored per-vCPU (not globally)
+*   because Windows 10/11 maintain per-processor IDTs.
 */
 #include "hv.h"
-
-extern VOID asm_host_nmi_handler(VOID);
-extern VOID asm_host_df_handler(VOID);
-extern VOID asm_host_gp_handler(VOID);
-extern VOID asm_host_default_handler(VOID);
 
 static VOID
 hostidt_set_gate(
@@ -42,24 +40,26 @@ hostidt_build(VOID)
 
     cs = asm_get_cs() & 0xF8;
 
-    g_host_idt.original_idt_base = asm_get_idt_base();
+    RtlZeroMemory(&g_host_fault_info, sizeof(g_host_fault_info));
 
     //
-    // default handler halts cpu — anything unexpected is a bug
+    // default handler records fault context and halts cpu
     //
     for (UINT32 i = 0; i < IDT_NUM_ENTRIES; i++)
         hostidt_set_gate(&g_host_idt.idt[i], (UINT64)asm_host_default_handler, cs, IDT_TYPE_INTERRUPT_GATE, 0);
 
     //
-    // NMI: sets pending flag, vmexit handler injects to guest
+    // NMI: atomically sets the per-core pending flag at the top of the
+    // 32KB-aligned VMM stack; the VM-exit handler injects NMI on that core.
     //
     hostidt_set_gate(&g_host_idt.idt[IDT_VECTOR_NMI], (UINT64)asm_host_nmi_handler, cs, IDT_TYPE_INTERRUPT_GATE, 0);
 
     //
-    // #DF/#GP: unrecoverable in host mode, halt
+    // #DF / #GP / #PF: record diagnostic snapshot in g_host_fault_info and halt
     //
     hostidt_set_gate(&g_host_idt.idt[IDT_VECTOR_DF], (UINT64)asm_host_df_handler, cs, IDT_TYPE_INTERRUPT_GATE, 0);
     hostidt_set_gate(&g_host_idt.idt[IDT_VECTOR_GP], (UINT64)asm_host_gp_handler, cs, IDT_TYPE_INTERRUPT_GATE, 0);
+    hostidt_set_gate(&g_host_idt.idt[IDT_VECTOR_PF], (UINT64)asm_host_pf_handler, cs, IDT_TYPE_INTERRUPT_GATE, 0);
 
     g_host_idt.initialized = TRUE;
     return TRUE;

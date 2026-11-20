@@ -11,12 +11,30 @@
 
 #include "ia32.h"
 #include "hv_types.h"
+#include "hv_ioctl.h"
 #include "asm_prototypes.h"
 #include "stealth.h"
 #include "win_compat.h"
 #include "cpuinfo.h"
 #include "svm.h"
 #include "hv_backend.h"
+
+//
+// logging macro — non-root ONLY. NEVER invoke from VMX-root / SVM host mode.
+//
+#ifndef HV_DEBUG_LOG
+#if DBG
+#define HV_DEBUG_LOG 1
+#else
+#define HV_DEBUG_LOG 0
+#endif
+#endif
+
+#if HV_DEBUG_LOG
+#define HV_LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[hv] " fmt, ##__VA_ARGS__)
+#else
+#define HV_LOG(fmt, ...) ((VOID)0)
+#endif
 
 UINT64 va_to_pa(PVOID va);
 PVOID  pa_to_va(UINT64 pa);
@@ -25,6 +43,8 @@ UINT64 get_system_cr3(VOID);
 //
 // private host page tables (hostcr3.c)
 //
+BOOLEAN hostcr3_init(VOID);
+BOOLEAN hostcr3_map_range(PVOID va, SIZE_T size, BOOLEAN executable);
 BOOLEAN hostcr3_build(VOID);
 UINT64  hostcr3_get(VOID);
 VOID    hostcr3_destroy(VOID);
@@ -39,15 +59,31 @@ VOID    hostidt_destroy(VOID);
 //
 // per-core private host GDT (hostgdt.c)
 //
-BOOLEAN hostgdt_build_for_vcpu(VIRTUAL_MACHINE_STATE * vcpu);
+BOOLEAN hostgdt_alloc_for_vcpu(VIRTUAL_MACHINE_STATE * vcpu);
+BOOLEAN hostgdt_populate_for_vcpu(VIRTUAL_MACHINE_STATE * vcpu);
 VOID    hostgdt_destroy_for_vcpu(VIRTUAL_MACHINE_STATE * vcpu);
 
 //
-// segment helpers (segment.c)
+// segment helpers (util.c)
 //
 VOID segment_get_descriptor(PUCHAR gdt_base, UINT16 selector, VMX_SEGMENT_SELECTOR * result);
 VOID segment_fill_vmcs(PVOID gdt_base, UINT32 seg_reg, UINT16 selector);
 
+//
+// shared VMX / SVM exit helpers (vmexit_common.c)
+//
+UINT64 * hv_gpr_ptr(PGUEST_REGS regs, UINT32 idx);
+VOID     hv_common_handle_cpuid(PGUEST_REGS regs, BOOLEAN is_amd);
+BOOLEAN  hv_common_handle_xsetbv(PGUEST_REGS regs);
+BOOLEAN  hv_common_check_vmcall_auth(PGUEST_REGS regs, UINT8 cpl);
+BOOLEAN  hv_common_is_synthetic_msr(UINT32 msr);
+BOOLEAN  hv_common_validate_cr0(UINT64 val);
+BOOLEAN  hv_common_validate_cr3(UINT64 val);
+BOOLEAN  hv_common_validate_cr4(UINT64 val);
+
+//
+// Intel VMX backend (vmx.c)
+//
 BOOLEAN vmx_check_support(VOID);
 BOOLEAN vmx_init(VOID);
 VOID    vmx_terminate(VOID);
@@ -65,6 +101,7 @@ VOID    vmx_set_fixed_bits(VOID);
 VOID    vmx_vmresume(VOID);
 UINT64  vmx_return_rsp_for_vmxoff(VIRTUAL_MACHINE_STATE * vcpu);
 UINT64  vmx_return_rip_for_vmxoff(VIRTUAL_MACHINE_STATE * vcpu);
+UINT64  vmx_return_rflags_for_vmxoff(VIRTUAL_MACHINE_STATE * vcpu);
 
 //
 // AMD SVM backend (svm.c)
@@ -74,15 +111,24 @@ BOOLEAN svm_init(VOID);
 VOID    svm_terminate(VOID);
 BOOLEAN svm_virtualize_cpu(PVOID guest_stack);
 VOID    svm_terminate_cpu(VOID);
-VOID    svm_exit_handler(PGUEST_REGS regs, VIRTUAL_MACHINE_STATE * vcpu);
+BOOLEAN svm_exit_handler(PGUEST_REGS regs, VIRTUAL_MACHINE_STATE * vcpu);
+UINT64  svm_return_rsp_for_off(VIRTUAL_MACHINE_STATE * vcpu);
+UINT64  svm_return_rip_for_off(VIRTUAL_MACHINE_STATE * vcpu);
+UINT64  svm_return_rflags_for_off(VIRTUAL_MACHINE_STATE * vcpu);
 
+//
+// EPT / NPT (ept.c)
+//
 BOOLEAN ept_check_features(VOID);
 BOOLEAN ept_build_mtrr_map(VOID);
 BOOLEAN ept_init(VOID);
 VOID    ept_destroy(VOID);
 UINT64  ept_pml4_pa(VOID);
+BOOLEAN ept_is_npt_mode(VOID);
 UINT8   ept_get_memory_type(SIZE_T pfn, BOOLEAN is_large_page);
 BOOLEAN ept_valid_for_large_page(SIZE_T pfn);
+BOOLEAN ept_handle_dynamic_mmio(UINT64 gpa);
+BOOLEAN ept_map_into_hostcr3(VOID);
 
 PEPT_PML1_ENTRY ept_get_pml1(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 PEPT_PML2_ENTRY ept_get_pml2(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
@@ -95,7 +141,7 @@ VOID vpid_invvpid_single(UINT16 vpid);
 BOOLEAN vmexit_handler(PGUEST_REGS regs, VIRTUAL_MACHINE_STATE * vcpu);
 
 //
-// exit sub-handlers
+// exit sub-handlers (vmexit.c)
 //
 VOID vmexit_handle_cpuid(VIRTUAL_MACHINE_STATE * vcpu);
 VOID vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu);

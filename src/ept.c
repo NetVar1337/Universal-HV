@@ -5,19 +5,175 @@
 *   physical) covering:
 *     - the low 4GB always (RAM + MMIO holes below 4GB)
 *     - every RAM range reported by MmGetPhysicalMemoryRanges
+*     - dynamic on-demand UC mapping from a pre-allocated root-mode page pool
+*       for above-4G MMIO (e.g. 64-bit PCIe BARs / Resizable BAR)
 *
-*   this makes the map correct on machines with more than 512GB of RAM and
-*   on LA57 (5-level paging) systems: the table is allocated dynamically
-*   per 512GB/1GB/2MB chunk instead of assuming a fixed 512GB layout, and it
-*   is clamped to 48-bit physical addresses (4-level walk, 256TB — beyond
-*   any shipping machine).
-*
-*   the same page-table format is used for AMD NPT (nested_cr3 points at the
-*   PML4), so one builder serves both backends.
+*   Intel builds true Intel EPT entries (R/W/X + EPT MemoryType in bits 5:3).
+*   AMD builds true x86-64 NPT entries (P/RW/US + PAT/PCD/PWT derived from
+*   IA32_PAT), never reusing EPT bit layouts on AMD.
 */
 #include "hv.h"
 
 #define EPT_MAX_PHYS_SUPPORTED   (1ULL << 48)   // 4-level walk limit
+
+BOOLEAN
+ept_is_npt_mode(VOID)
+{
+    return (g_ept && g_ept->is_npt) ? TRUE : FALSE;
+}
+
+static VOID
+ept_init_npt_pat_map(VOID)
+{
+    UINT64 pat = __readmsr(IA32_PAT);
+    UINT8  uc_idx = 3; // default architectural PAT index 3 = UC
+
+    //
+    // find an index encoding UC first as a safe fallback
+    //
+    for (UINT8 idx = 0; idx < 8; idx++)
+    {
+        UINT8 type = (UINT8)((pat >> (idx * 8)) & 0xFF);
+        if (type == MEMORY_TYPE_UNCACHEABLE)
+        {
+            uc_idx = idx;
+            break;
+        }
+    }
+
+    for (UINT32 mt = 0; mt < 8; mt++)
+        g_ept->npt_pat_index[mt] = uc_idx;
+
+    for (UINT8 idx = 0; idx < 8; idx++)
+    {
+        UINT8 type = (UINT8)((pat >> (idx * 8)) & 0xFF);
+        if (type < 8 && g_ept->npt_pat_index[type] == uc_idx)
+            g_ept->npt_pat_index[type] = idx;
+    }
+
+    //
+    // ensure UC itself maps to uc_idx
+    //
+    g_ept->npt_pat_index[MEMORY_TYPE_UNCACHEABLE] = uc_idx;
+}
+
+static __forceinline UINT64
+npt_pat_bits(UINT8 mem_type, BOOLEAN is_2mb)
+{
+    UINT8  idx = (mem_type < 8) ? g_ept->npt_pat_index[mem_type] : g_ept->npt_pat_index[MEMORY_TYPE_UNCACHEABLE];
+    UINT64 bits = 0;
+
+    if (idx & 1U) bits |= NPT_PTE_PWT;
+    if (idx & 2U) bits |= NPT_PTE_PCD;
+    if (idx & 4U) bits |= (is_2mb ? NPT_PTE_PAT_2M : NPT_PTE_PAT_4K);
+    return bits;
+}
+
+static __forceinline UINT64
+ept_make_nonleaf(UINT64 next_pa)
+{
+    if (g_ept->is_npt)
+    {
+        return NPT_PTE_PRESENT | NPT_PTE_WRITE | NPT_PTE_USER | (next_pa & NPT_PTE_PFN_MASK);
+    }
+    else
+    {
+        EPT_PML4_ENTRY e = {0};
+        e.ReadAccess      = 1;
+        e.WriteAccess     = 1;
+        e.ExecuteAccess   = 1;
+        e.PageFrameNumber = next_pa / PAGE_SIZE;
+        return e.AsUInt;
+    }
+}
+
+static __forceinline UINT64
+ept_make_leaf_2mb(SIZE_T pfn2mb, UINT8 mem_type)
+{
+    if (g_ept->is_npt)
+    {
+        return NPT_PTE_PRESENT | NPT_PTE_WRITE | NPT_PTE_USER | NPT_PTE_LARGE_PAGE |
+               (((UINT64)pfn2mb) << 21) | npt_pat_bits(mem_type, TRUE);
+    }
+    else
+    {
+        EPT_PML2_ENTRY e = {0};
+        e.ReadAccess      = 1;
+        e.WriteAccess     = 1;
+        e.ExecuteAccess   = 1;
+        e.LargePage       = 1;
+        e.MemoryType      = mem_type;
+        e.PageFrameNumber = (UINT64)pfn2mb;
+        return e.AsUInt;
+    }
+}
+
+static __forceinline UINT64
+ept_make_leaf_4kb(SIZE_T pfn4k, UINT8 mem_type)
+{
+    if (g_ept->is_npt)
+    {
+        return NPT_PTE_PRESENT | NPT_PTE_WRITE | NPT_PTE_USER |
+               (((UINT64)pfn4k) << 12) | npt_pat_bits(mem_type, FALSE);
+    }
+    else
+    {
+        EPT_PML1_ENTRY e = {0};
+        e.ReadAccess      = 1;
+        e.WriteAccess     = 1;
+        e.ExecuteAccess   = 1;
+        e.MemoryType      = mem_type;
+        e.PageFrameNumber = (UINT64)pfn4k;
+        return e.AsUInt;
+    }
+}
+
+static __forceinline BOOLEAN
+ept_entry_is_present(UINT64 raw)
+{
+    // bit 0 is ReadAccess on Intel EPT and Present on AMD NPT
+    return (raw & 1ULL) ? TRUE : FALSE;
+}
+
+static __forceinline BOOLEAN
+ept_entry_is_large(UINT64 raw)
+{
+    // bit 7 is LargePage on Intel EPT PDE and PS on AMD NPT PDE
+    return (raw & (1ULL << 7)) ? TRUE : FALSE;
+}
+
+static __forceinline UINT64
+ept_entry_next_pa(UINT64 raw)
+{
+    return raw & NPT_PTE_PFN_MASK;
+}
+
+//
+// root-mode-safe PA->VA lookup using tracked EPT/NPT page table entries
+// (ZERO Windows API calls — safe inside VMX-root / SVM host mode).
+//
+static PVOID
+ept_tracked_pa_to_va(PVMM_EPT_PAGE_TABLE table, UINT64 pa)
+{
+    UINT64 target = pa & ~0xFFFULL;
+
+    if (target == table->PML4_Pa)
+        return table->PML4_Page;
+
+    for (UINT32 i = 0; i < table->TrackedCount; i++)
+    {
+        if (table->Tracked[i].Pa == target)
+            return table->Tracked[i].Va;
+    }
+
+    for (UINT32 i = 0; i < table->DynPoolUsed; i++)
+    {
+        if (table->DynPool[i].Pa == target)
+            return table->DynPool[i].Va;
+    }
+
+    return NULL;
+}
 
 BOOLEAN
 ept_check_features(VOID)
@@ -30,28 +186,24 @@ ept_check_features(VOID)
     {
         IA32_VMX_EPT_VPID_CAP_REGISTER vpid_reg;
 
+        g_ept->is_npt = FALSE;
         vpid_reg.AsUInt = __readmsr(IA32_VMX_EPT_VPID_CAP);
 
         if (!vpid_reg.PageWalkLength4 || !vpid_reg.MemoryTypeWriteBack || !vpid_reg.Pde2MbPages)
         {
-            DbgPrintEx(0, 0, "[hv] EPT: missing required features (PW4=%d WB=%d 2MB=%d)\n",
-                     vpid_reg.PageWalkLength4, vpid_reg.MemoryTypeWriteBack, vpid_reg.Pde2MbPages);
+            HV_LOG("EPT: missing required features (PW4=%d WB=%d 2MB=%d)\n",
+                   vpid_reg.PageWalkLength4, vpid_reg.MemoryTypeWriteBack, vpid_reg.Pde2MbPages);
             return FALSE;
         }
 
         g_ept->ad_supported = vpid_reg.EptAccessedAndDirtyFlags ? TRUE : FALSE;
 
-        g_ept->invvpid_supported              = vpid_reg.Invvpid ? TRUE : FALSE;
-        g_ept->invvpid_individual_addr        = vpid_reg.InvvpidIndividualAddress ? TRUE : FALSE;
-        g_ept->invvpid_single_context         = vpid_reg.InvvpidSingleContext ? TRUE : FALSE;
-        g_ept->invvpid_all_contexts           = vpid_reg.InvvpidAllContexts ? TRUE : FALSE;
+        g_ept->invvpid_supported                = vpid_reg.Invvpid ? TRUE : FALSE;
+        g_ept->invvpid_individual_addr          = vpid_reg.InvvpidIndividualAddress ? TRUE : FALSE;
+        g_ept->invvpid_single_context           = vpid_reg.InvvpidSingleContext ? TRUE : FALSE;
+        g_ept->invvpid_all_contexts             = vpid_reg.InvvpidAllContexts ? TRUE : FALSE;
         g_ept->invvpid_single_retaining_globals = vpid_reg.InvvpidSingleContextRetainingGlobals ? TRUE : FALSE;
 
-        //
-        // EPT requires the secondary "activate secondary controls" and
-        // "enable EPT" bits to be allowed-1. without them there is no EPT
-        // and this hypervisor cannot run (no shadow paging fallback).
-        //
         {
             IA32_VMX_BASIC_REGISTER vmx_basic = {0};
             MSR msr = {0};
@@ -60,41 +212,39 @@ ept_check_features(VOID)
                                                         : IA32_VMX_PROCBASED_CTLS);
             if (!(msr.Fields.High & CPU_BASED_VM_EXEC_CTRL_ACTIVATE_SECONDARY_CONTROLS))
             {
-                DbgPrintEx(0, 0, "[hv] EPT: secondary controls not supported — CPU too old\n");
+                HV_LOG("EPT: secondary controls not supported — CPU too old\n");
                 return FALSE;
             }
             msr.Flags = __readmsr(IA32_VMX_PROCBASED_CTLS2);
             if (!(msr.Fields.High & CPU_BASED_VM_EXEC_CTRL2_ENABLE_EPT))
             {
-                DbgPrintEx(0, 0, "[hv] EPT: ENABLE_EPT not supported on this CPU\n");
+                HV_LOG("EPT: ENABLE_EPT not supported on this CPU\n");
                 return FALSE;
             }
         }
 
-        DbgPrintEx(0, 0, "[hv] INVVPID caps: supported=%d individual=%d single=%d all=%d retaining=%d\n",
-                 g_ept->invvpid_supported,
-                 g_ept->invvpid_individual_addr,
-                 g_ept->invvpid_single_context,
-                 g_ept->invvpid_all_contexts,
-                 g_ept->invvpid_single_retaining_globals);
+        HV_LOG("INVVPID caps: supported=%d individual=%d single=%d all=%d retaining=%d\n",
+               g_ept->invvpid_supported,
+               g_ept->invvpid_individual_addr,
+               g_ept->invvpid_single_context,
+               g_ept->invvpid_all_contexts,
+               g_ept->invvpid_single_retaining_globals);
     }
     else if (g_cpu.vendor == HV_VENDOR_AMD)
     {
+        g_ept->is_npt        = TRUE;
         g_ept->npt_supported = (g_cpu.svm_features & SVM_FEATURE_NP) ? TRUE : FALSE;
         if (!g_ept->npt_supported)
         {
-            DbgPrintEx(0, 0, "[hv] NPT: nested paging not supported on this CPU\n");
+            HV_LOG("NPT: nested paging not supported on this CPU\n");
             return FALSE;
         }
+        ept_init_npt_pat_map();
     }
 
     if (!mtrr_def.MtrrEnable)
     {
-        //
-        // legal on some firmware configurations; everything defaults to UC
-        // except what the RAM map says (WB).
-        //
-        DbgPrintEx(0, 0, "[hv] EPT/NPT: MTRR not enabled, defaulting to UC\n");
+        HV_LOG("EPT/NPT: MTRR not enabled, defaulting to UC\n");
         g_ept->default_type = MEMORY_TYPE_UNCACHEABLE;
     }
 
@@ -115,7 +265,7 @@ ept_addr_in_ram(UINT64 addr)
 UINT8
 ept_get_memory_type(SIZE_T pfn, BOOLEAN is_large_page)
 {
-    SIZE_T page_addr = is_large_page ? pfn * SIZE_2_MB : pfn * PAGE_SIZE;
+    UINT64 page_addr   = is_large_page ? ((UINT64)pfn * SIZE_2_MB) : ((UINT64)pfn * PAGE_SIZE);
     UINT8  target_type = (UINT8)-1;
 
     //
@@ -128,18 +278,24 @@ ept_get_memory_type(SIZE_T pfn, BOOLEAN is_large_page)
         {
             MTRR_RANGE_DESCRIPTOR * range = &g_ept->mem_ranges[i];
             if (range->fixed &&
-                page_addr >= range->phys_base && page_addr < range->phys_end)
+                page_addr >= range->phys_base && page_addr <= range->phys_end)
                 return range->mem_type;
         }
         return MEMORY_TYPE_UNCACHEABLE;
     }
 
+    //
+    // Intel SDM Vol 3 Section 11.11.4.1 (MTRR Precedences):
+    //   1. Fixed-range MTRRs take precedence over variable-range MTRRs.
+    //   2. Among overlapping variable-range MTRRs:
+    //      - If ANY overlapping range is UC, effective type is UC.
+    //      - If overlapping ranges are WT and WB, effective type is WT.
+    //
     for (UINT32 i = 0; i < g_ept->num_ranges; i++)
     {
         MTRR_RANGE_DESCRIPTOR * range = &g_ept->mem_ranges[i];
 
-        if (page_addr >= range->phys_base &&
-            page_addr < range->phys_end)
+        if (page_addr >= range->phys_base && page_addr <= range->phys_end)
         {
             if (range->fixed)
             {
@@ -147,23 +303,29 @@ ept_get_memory_type(SIZE_T pfn, BOOLEAN is_large_page)
                 break;
             }
 
-            if (target_type == MEMORY_TYPE_UNCACHEABLE)
+            if (range->mem_type == MEMORY_TYPE_UNCACHEABLE)
             {
-                target_type = range->mem_type;
+                target_type = MEMORY_TYPE_UNCACHEABLE;
                 break;
             }
 
-            if (target_type == MEMORY_TYPE_WRITE_THROUGH ||
-                range->mem_type == MEMORY_TYPE_WRITE_THROUGH)
+            if (target_type == (UINT8)-1)
             {
-                if (target_type == MEMORY_TYPE_WRITE_BACK)
-                {
-                    target_type = MEMORY_TYPE_WRITE_THROUGH;
-                    continue;
-                }
+                target_type = range->mem_type;
             }
-
-            target_type = range->mem_type;
+            else if ((target_type == MEMORY_TYPE_WRITE_THROUGH && range->mem_type == MEMORY_TYPE_WRITE_BACK) ||
+                     (target_type == MEMORY_TYPE_WRITE_BACK && range->mem_type == MEMORY_TYPE_WRITE_THROUGH))
+            {
+                target_type = MEMORY_TYPE_WRITE_THROUGH;
+            }
+            else if (range->mem_type != target_type)
+            {
+                //
+                // undefined overlap per SDM — safest architectural choice is UC
+                //
+                target_type = MEMORY_TYPE_UNCACHEABLE;
+                break;
+            }
         }
     }
 
@@ -200,8 +362,8 @@ ept_build_mtrr_map(VOID)
         {
             desc = &g_ept->mem_ranges[g_ept->num_ranges++];
             desc->mem_type  = k64_types.s.Types[i];
-            desc->phys_base = 0x10000 * i;
-            desc->phys_end  = 0x10000 * i + 0x10000 - 1;
+            desc->phys_base = 0x10000ULL * i;
+            desc->phys_end  = desc->phys_base + 0x10000ULL - 1ULL;
             desc->fixed     = TRUE;
         }
 
@@ -212,8 +374,8 @@ ept_build_mtrr_map(VOID)
             {
                 desc = &g_ept->mem_ranges[g_ept->num_ranges++];
                 desc->mem_type  = k16_types.s.Types[j];
-                desc->phys_base = 0x80000 + (i * 0x20000) + (j * 0x4000);
-                desc->phys_end  = desc->phys_base + 0x4000 - 1;
+                desc->phys_base = 0x80000ULL + ((UINT64)i * 0x20000ULL) + ((UINT64)j * 0x4000ULL);
+                desc->phys_end  = desc->phys_base + 0x4000ULL - 1ULL;
                 desc->fixed     = TRUE;
             }
         }
@@ -225,8 +387,8 @@ ept_build_mtrr_map(VOID)
             {
                 desc = &g_ept->mem_ranges[g_ept->num_ranges++];
                 desc->mem_type  = k4_types.s.Types[j];
-                desc->phys_base = 0xC0000 + (i * 0x8000) + (j * 0x1000);
-                desc->phys_end  = desc->phys_base + 0x1000 - 1;
+                desc->phys_base = 0xC0000ULL + ((UINT64)i * 0x8000ULL) + ((UINT64)j * 0x1000ULL);
+                desc->phys_end  = desc->phys_base + 0x1000ULL - 1ULL;
                 desc->fixed     = TRUE;
             }
         }
@@ -242,20 +404,21 @@ ept_build_mtrr_map(VOID)
 
         if (cur_mask.Valid)
         {
+            ULONG mask_bits = 0;
+            UINT64 mask_val = cur_mask.PageFrameNumber * PAGE_SIZE;
+            if (!mask_val || !_BitScanForward64(&mask_bits, mask_val))
+                continue;
+
             desc = &g_ept->mem_ranges[g_ept->num_ranges++];
             desc->phys_base = cur_base.PageFrameNumber * PAGE_SIZE;
-
-            ULONG mask_bits;
-            _BitScanForward64(&mask_bits, cur_mask.PageFrameNumber * PAGE_SIZE);
-
-            desc->phys_end = desc->phys_base + ((1ULL << mask_bits) - 1ULL);
-            desc->mem_type = (UINT8)cur_base.Type;
-            desc->fixed    = FALSE;
+            desc->phys_end  = desc->phys_base + ((1ULL << mask_bits) - 1ULL);
+            desc->mem_type  = (UINT8)cur_base.Type;
+            desc->fixed     = FALSE;
         }
     }
 
     //
-    // physical RAM ranges (drives the identity map on big machines)
+    // physical RAM ranges
     //
     {
         PPHYSICAL_MEMORY_RANGE ranges = MmGetPhysicalMemoryRanges();
@@ -265,17 +428,20 @@ ept_build_mtrr_map(VOID)
             {
                 if (g_ept->num_ram_ranges >= MAX_RAM_RANGES)
                     break;
+                if (ranges[i].NumberOfBytes.QuadPart == 0)
+                    continue;
                 g_ept->ram_ranges[g_ept->num_ram_ranges].base = (UINT64)ranges[i].BaseAddress.QuadPart;
                 g_ept->ram_ranges[g_ept->num_ram_ranges].end  =
-                    (UINT64)ranges[i].BaseAddress.QuadPart + (UINT64)ranges[i].NumberOfBytes.QuadPart - 1;
+                    (UINT64)ranges[i].BaseAddress.QuadPart + (UINT64)ranges[i].NumberOfBytes.QuadPart - 1ULL;
                 g_ept->num_ram_ranges++;
             }
             ExFreePool(ranges);
         }
     }
 
-    DbgPrintEx(0, 0, "[hv] EPT/NPT: %u MTRR ranges, %u RAM ranges, maxphyaddr=%u\n",
-             g_ept->num_ranges, g_ept->num_ram_ranges, g_ept->maxphyaddr);
+    HV_LOG("EPT/NPT: %u MTRR ranges, %u RAM ranges, maxphyaddr=%u, mode=%s\n",
+           g_ept->num_ranges, g_ept->num_ram_ranges, g_ept->maxphyaddr,
+           g_ept->is_npt ? "AMD-NPT" : "Intel-EPT");
 
     return TRUE;
 }
@@ -283,11 +449,11 @@ ept_build_mtrr_map(VOID)
 BOOLEAN
 ept_valid_for_large_page(SIZE_T pfn2mb)
 {
-    SIZE_T start_addr = pfn2mb * SIZE_2_MB;
-    SIZE_T end_addr   = start_addr + SIZE_2_MB - 1;
+    UINT64 start_addr = (UINT64)pfn2mb * SIZE_2_MB;
+    UINT64 end_addr   = start_addr + SIZE_2_MB - 1ULL;
 
     //
-    // must not cross an MTRR boundary
+    // must not cross or partially overlap any MTRR boundary
     //
     for (UINT32 i = 0; i < g_ept->num_ranges; i++)
     {
@@ -301,162 +467,179 @@ ept_valid_for_large_page(SIZE_T pfn2mb)
     }
 
     //
-    // must not cross a RAM/non-RAM boundary (MMIO hole inside the 2MB chunk)
+    // must not cross or partially contain ANY RAM/non-RAM boundary
+    // (catches small MMIO holes strictly inside the 2MB chunk too!)
     //
-    if (ept_addr_in_ram(start_addr) != ept_addr_in_ram(end_addr))
-        return FALSE;
+    for (UINT32 i = 0; i < g_ept->num_ram_ranges; i++)
+    {
+        RAM_RANGE * ram = &g_ept->ram_ranges[i];
+
+        if ((start_addr <= ram->end && end_addr > ram->end) ||
+            (start_addr < ram->base && end_addr >= ram->base))
+        {
+            return FALSE;
+        }
+    }
 
     return TRUE;
 }
 
 static PVOID
-ept_alloc_table(PVMM_EPT_PAGE_TABLE table)
+ept_alloc_table(PVMM_EPT_PAGE_TABLE table, UINT64 *pa_out)
 {
+    if (table->TrackedCount >= EPT_MAX_TRACKED_PAGES)
+        return NULL;
+
     PVOID page = hv_alloc_contiguous(PAGE_SIZE);
     if (!page)
         return NULL;
 
     RtlZeroMemory(page, PAGE_SIZE);
+    UINT64 pa = va_to_pa(page);
 
-    PVMM_EPT_ALLOC alloc = (PVMM_EPT_ALLOC)hv_pool_alloc(sizeof(VMM_EPT_ALLOC));
-    if (!alloc)
-    {
-        hv_free_contiguous(page);
-        return NULL;
-    }
-    alloc->Page = page;
-    InsertTailList(&table->AllocList, &alloc->Link);
-    table->AllocCount++;
+    table->Tracked[table->TrackedCount].Va = page;
+    table->Tracked[table->TrackedCount].Pa = pa;
+    table->TrackedCount++;
+
+    if (pa_out)
+        *pa_out = pa;
     return page;
 }
 
-/*
-*   ensure the PML3 table for pml4 index exists; returns its VA
-*/
 static PVOID
 ept_ensure_pml3(PVMM_EPT_PAGE_TABLE table, UINT32 pml4_idx)
 {
     if (table->PML3[pml4_idx])
         return table->PML3[pml4_idx];
 
-    PVOID pml3 = ept_alloc_table(table);
+    UINT64 pml3_pa = 0;
+    PVOID  pml3    = ept_alloc_table(table, &pml3_pa);
     if (!pml3)
         return NULL;
 
     table->PML3[pml4_idx] = pml3;
-
-    EPT_PML4_ENTRY e = {0};
-    e.ReadAccess = e.WriteAccess = e.ExecuteAccess = 1;
-    e.PageFrameNumber = va_to_pa(pml3) / PAGE_SIZE;
-    table->PML4[pml4_idx] = e;
-
+    ((PUINT64)table->PML4_Page)[pml4_idx] = ept_make_nonleaf(pml3_pa);
     return pml3;
 }
 
-/*
-*   ensure the PML2 table (1GB chunk) for a guest-physical address exists;
-*   returns pointer to the PML2 entry slot.
-*/
-static PEPT_PML2_ENTRY
-ept_ensure_pml2_entry(PVMM_EPT_PAGE_TABLE table, UINT64 addr)
+static PUINT64
+ept_ensure_pml2_slot(PVMM_EPT_PAGE_TABLE table, UINT64 addr)
 {
-    UINT32 pml4_idx = (UINT32)(addr >> 39) & 0x1FF;
-    UINT32 pml3_idx = (UINT32)(addr >> 30) & 0x1FF;
-    UINT32 pml2_idx = (UINT32)(addr >> 21) & 0x1FF;
+    UINT32 pml4_idx = (UINT32)(addr >> 39) & 0x1FFU;
+    UINT32 pml3_idx = (UINT32)(addr >> 30) & 0x1FFU;
+    UINT32 pml2_idx = (UINT32)(addr >> 21) & 0x1FFU;
 
     PVOID pml3 = ept_ensure_pml3(table, pml4_idx);
     if (!pml3)
         return NULL;
 
-    EPT_PML3_POINTER * pml3e = (EPT_PML3_POINTER *)((PUINT8)pml3 + pml3_idx * 8);
-    if (!pml3e->ReadAccess)
+    PUINT64 pml3e = &((PUINT64)pml3)[pml3_idx];
+    if (!ept_entry_is_present(*pml3e))
     {
-        PVOID pml2 = ept_alloc_table(table);
+        UINT64 pml2_pa = 0;
+        PVOID  pml2    = ept_alloc_table(table, &pml2_pa);
         if (!pml2)
             return NULL;
 
-        EPT_PML3_POINTER e = {0};
-        e.ReadAccess = e.WriteAccess = e.ExecuteAccess = 1;
-        e.PageFrameNumber = va_to_pa(pml2) / PAGE_SIZE;
-        *pml3e = e;
-
-        return (PEPT_PML2_ENTRY)((PUINT8)pml2 + pml2_idx * 8);
+        *pml3e = ept_make_nonleaf(pml2_pa);
+        return &((PUINT64)pml2)[pml2_idx];
     }
 
-    PVOID pml2 = pa_to_va(pml3e->PageFrameNumber * PAGE_SIZE);
-    return (PEPT_PML2_ENTRY)((PUINT8)pml2 + pml2_idx * 8);
+    PVOID pml2 = ept_tracked_pa_to_va(table, ept_entry_next_pa(*pml3e));
+    if (!pml2)
+        return NULL;
+
+    return &((PUINT64)pml2)[pml2_idx];
 }
 
-/*
-*   map one 2MB chunk. splits to 4KB pages when it crosses an MTRR or
-*   RAM boundary.
-*/
 static BOOLEAN
 ept_map_2mb(PVMM_EPT_PAGE_TABLE table, UINT64 addr2mb)
 {
-    PEPT_PML2_ENTRY entry = ept_ensure_pml2_entry(table, addr2mb);
-    if (!entry)
+    PUINT64 slot = ept_ensure_pml2_slot(table, addr2mb);
+    if (!slot)
         return FALSE;
 
-    SIZE_T pfn2mb = addr2mb / SIZE_2_MB;
+    //
+    // already mapped (overlapping low-4GB and RAM ranges) — avoid leaking
+    // a duplicate PML1 table if already split
+    //
+    if (ept_entry_is_present(*slot))
+        return TRUE;
+
+    SIZE_T pfn2mb = (SIZE_T)(addr2mb / SIZE_2_MB);
 
     if (ept_valid_for_large_page(pfn2mb))
     {
-        EPT_PML2_ENTRY e = {0};
-        e.ReadAccess = e.WriteAccess = e.ExecuteAccess = 1;
-        e.LargePage  = 1;
-        e.MemoryType = ept_get_memory_type(pfn2mb, TRUE);
-        e.PageFrameNumber = (UINT32)pfn2mb;
-        *entry = e;
+        *slot = ept_make_leaf_2mb(pfn2mb, ept_get_memory_type(pfn2mb, TRUE));
         return TRUE;
     }
 
     //
-    // crosses a boundary — split into 512 4KB pages
+    // crosses an MTRR or RAM boundary — split into 512 4KB pages
     //
-    PVOID pml1 = ept_alloc_table(table);
+    UINT64 pml1_pa = 0;
+    PVOID  pml1    = ept_alloc_table(table, &pml1_pa);
     if (!pml1)
         return FALSE;
 
+    PUINT64 pml1_entries = (PUINT64)pml1;
     for (UINT32 i = 0; i < 512; i++)
     {
-        EPT_PML1_ENTRY e = {0};
-        e.ReadAccess = e.WriteAccess = e.ExecuteAccess = 1;
-        e.MemoryType = ept_get_memory_type(pfn2mb * 512 + i, FALSE);
-        e.PageFrameNumber = pfn2mb * 512 + i;
-        ((PEPT_PML1_ENTRY)pml1)[i] = e;
+        SIZE_T pfn4k = pfn2mb * 512 + i;
+        pml1_entries[i] = ept_make_leaf_4kb(pfn4k, ept_get_memory_type(pfn4k, FALSE));
     }
 
-    EPT_PML2_POINTER p = {0};
-    p.ReadAccess = p.WriteAccess = p.ExecuteAccess = 1;
-    p.PageFrameNumber = va_to_pa(pml1) / PAGE_SIZE;
-    *(EPT_PML2_POINTER *)entry = p;
-
+    *slot = ept_make_nonleaf(pml1_pa);
     return TRUE;
 }
 
 static BOOLEAN
 ept_map_range(PVMM_EPT_PAGE_TABLE table, UINT64 base, UINT64 end)
 {
+    if (base >= EPT_MAX_PHYS_SUPPORTED)
+        return TRUE;
+
     if (end >= EPT_MAX_PHYS_SUPPORTED)
     {
-        DbgPrintEx(0, 0, "[hv] EPT/NPT: RAM above 48-bit physical (0x%llx) not mapped (no 4-level walk)\n", end);
-        end = EPT_MAX_PHYS_SUPPORTED - 1;
+        HV_LOG("EPT/NPT: clamping range end 0x%llx to 48-bit walk limit\n", end);
+        end = EPT_MAX_PHYS_SUPPORTED - 1ULL;
     }
 
-    UINT64 addr = base & ~(SIZE_2_MB - 1);
+    UINT64 addr = base & ~(SIZE_2_MB - 1ULL);
     for (; addr <= end; addr += SIZE_2_MB)
     {
         if (!ept_map_2mb(table, addr))
             return FALSE;
+        if (addr > EPT_MAX_PHYS_SUPPORTED - SIZE_2_MB)
+            break;
     }
     return TRUE;
 }
 
-/*
-*   build the shared identity map: low 4GB (MMIO + low RAM) plus every RAM
-*   range in the machine.
-*/
+static VOID
+ept_free_page_table(PVMM_EPT_PAGE_TABLE table)
+{
+    if (!table)
+        return;
+
+    for (UINT32 i = 0; i < table->TrackedCount; i++)
+    {
+        if (table->Tracked[i].Va)
+            hv_free_contiguous(table->Tracked[i].Va);
+    }
+
+    for (UINT32 i = 0; i < table->DynPoolCount; i++)
+    {
+        if (table->DynPool[i].Va)
+            hv_free_contiguous(table->DynPool[i].Va);
+    }
+
+    if (table->PML4_Page)
+        hv_free_contiguous(table->PML4_Page);
+
+    hv_pool_free(table);
+}
+
 static PVMM_EPT_PAGE_TABLE
 ept_alloc_identity_map(VOID)
 {
@@ -464,32 +647,195 @@ ept_alloc_identity_map(VOID)
     if (!table)
         return NULL;
     RtlZeroMemory(table, sizeof(VMM_EPT_PAGE_TABLE));
-    InitializeListHead(&table->AllocList);
 
     //
-    // low 4GB always (covers all chipset MMIO below 4GB)
+    // allocate PML4 via hv_alloc_contiguous(PAGE_SIZE) for guaranteed 4KB
+    // physical alignment (even under Driver Verifier Special Pool).
+    //
+    table->PML4_Page = hv_alloc_contiguous(PAGE_SIZE);
+    if (!table->PML4_Page)
+    {
+        hv_pool_free(table);
+        return NULL;
+    }
+    RtlZeroMemory(table->PML4_Page, PAGE_SIZE);
+    table->PML4_Pa = va_to_pa(table->PML4_Page);
+
+    //
+    // pre-allocate root-mode dynamic page pool (for on-demand above-4G MMIO
+    // mapping such as 64-bit PCIe BARs / Resizable BAR).
+    //
+    for (UINT32 i = 0; i < EPT_DYN_POOL_PAGES; i++)
+    {
+        PVOID page = hv_alloc_contiguous(PAGE_SIZE);
+        if (!page)
+            break;
+        RtlZeroMemory(page, PAGE_SIZE);
+        table->DynPool[table->DynPoolCount].Va = page;
+        table->DynPool[table->DynPoolCount].Pa = va_to_pa(page);
+        table->DynPoolCount++;
+    }
+
+    //
+    // low 4GB always (covers chipset MMIO + low RAM)
     //
     if (!ept_map_range(table, 0, 0xFFFFFFFFULL))
     {
-        DbgPrintEx(0, 0, "[hv] EPT/NPT: failed to map low 4GB\n");
+        HV_LOG("EPT/NPT: failed to map low 4GB\n");
+        ept_free_page_table(table);
         return NULL;
     }
 
     //
-    // all RAM ranges (handles >512GB machines)
+    // all physical RAM ranges (handles >512GB machines)
     //
     for (UINT32 i = 0; i < g_ept->num_ram_ranges; i++)
     {
         if (!ept_map_range(table, g_ept->ram_ranges[i].base, g_ept->ram_ranges[i].end))
         {
-            DbgPrintEx(0, 0, "[hv] EPT/NPT: failed to map RAM range 0x%llx-0x%llx\n",
-                     g_ept->ram_ranges[i].base, g_ept->ram_ranges[i].end);
+            HV_LOG("EPT/NPT: failed to map RAM range 0x%llx-0x%llx\n",
+                   g_ept->ram_ranges[i].base, g_ept->ram_ranges[i].end);
+            ept_free_page_table(table);
             return NULL;
         }
     }
 
-    DbgPrintEx(0, 0, "[hv] EPT/NPT: identity map built (%u table pages)\n", table->AllocCount);
+    HV_LOG("EPT/NPT: identity map built (%u table pages, %u dyn pool pages)\n",
+           table->TrackedCount, table->DynPoolCount);
     return table;
+}
+
+//
+// root-mode-safe dynamic UC mapping for unmapped above-4G MMIO (64-bit PCIe BARs,
+// Resizable BAR, APIC/ACPI tables outside RAM map). ZERO Windows API calls!
+// returns TRUE if the GPA was newly mapped (or already mapped by a racing core)
+// so the guest instruction can be retried; FALSE if out of range / pool exhausted.
+//
+BOOLEAN
+ept_handle_dynamic_mmio(UINT64 gpa)
+{
+    if (!g_ept || !g_ept->page_table)
+        return FALSE;
+
+    if (gpa >= EPT_MAX_PHYS_SUPPORTED)
+        return FALSE;
+
+    //
+    // reject non-architectural physical addresses beyond MAXPHYADDR
+    //
+    if (g_ept->maxphyaddr < 48 && gpa >= (1ULL << g_ept->maxphyaddr))
+        return FALSE;
+
+    PVMM_EPT_PAGE_TABLE table = g_ept->page_table;
+    UINT64 addr2mb  = gpa & ~(SIZE_2_MB - 1ULL);
+    UINT32 pml4_idx = (UINT32)(addr2mb >> 39) & 0x1FFU;
+    UINT32 pml3_idx = (UINT32)(addr2mb >> 30) & 0x1FFU;
+    UINT32 pml2_idx = (UINT32)(addr2mb >> 21) & 0x1FFU;
+    BOOLEAN mapped  = FALSE;
+
+    //
+    // acquire simple root-mode spinlock
+    //
+    while (_InterlockedCompareExchange(&table->DynLock, 1, 0) != 0)
+        _mm_pause();
+
+    //
+    // step 1: ensure PML3
+    //
+    PVOID pml3 = table->PML3[pml4_idx];
+    if (!pml3)
+    {
+        if (table->DynPoolUsed < table->DynPoolCount)
+        {
+            VMM_EPT_PAGE *pg = &table->DynPool[table->DynPoolUsed++];
+            pml3 = pg->Va;
+            table->PML3[pml4_idx] = pml3;
+            ((PUINT64)table->PML4_Page)[pml4_idx] = ept_make_nonleaf(pg->Pa);
+        }
+    }
+
+    if (pml3)
+    {
+        //
+        // step 2: ensure PML2
+        //
+        PUINT64 pml3e = &((PUINT64)pml3)[pml3_idx];
+        PVOID   pml2  = NULL;
+
+        if (!ept_entry_is_present(*pml3e))
+        {
+            if (table->DynPoolUsed < table->DynPoolCount)
+            {
+                VMM_EPT_PAGE *pg = &table->DynPool[table->DynPoolUsed++];
+                pml2 = pg->Va;
+                *pml3e = ept_make_nonleaf(pg->Pa);
+            }
+        }
+        else
+        {
+            pml2 = ept_tracked_pa_to_va(table, ept_entry_next_pa(*pml3e));
+        }
+
+        if (pml2)
+        {
+            //
+            // step 3: map 2MB chunk as UC if currently absent
+            //
+            PUINT64 pml2e = &((PUINT64)pml2)[pml2_idx];
+            if (!ept_entry_is_present(*pml2e))
+            {
+                SIZE_T pfn2mb = (SIZE_T)(addr2mb / SIZE_2_MB);
+                *pml2e = ept_make_leaf_2mb(pfn2mb, MEMORY_TYPE_UNCACHEABLE);
+                _InterlockedIncrement64(&table->DynMappedCount);
+                mapped = TRUE;
+            }
+            else
+            {
+                //
+                // another core already mapped this 2MB chunk concurrently
+                //
+                mapped = TRUE;
+            }
+        }
+    }
+
+    _InterlockedExchange(&table->DynLock, 0);
+    return mapped;
+}
+
+BOOLEAN
+ept_map_into_hostcr3(VOID)
+{
+    if (!g_ept)
+        return TRUE;
+
+    if (!hostcr3_map_range(g_ept, sizeof(EPT_STATE), FALSE))
+        return FALSE;
+
+    if (g_ept->page_table)
+    {
+        PVMM_EPT_PAGE_TABLE table = g_ept->page_table;
+
+        if (!hostcr3_map_range(table, sizeof(VMM_EPT_PAGE_TABLE), FALSE))
+            return FALSE;
+
+        if (table->PML4_Page && !hostcr3_map_range(table->PML4_Page, PAGE_SIZE, FALSE))
+            return FALSE;
+
+        for (UINT32 i = 0; i < table->TrackedCount; i++)
+        {
+            if (table->Tracked[i].Va && !hostcr3_map_range(table->Tracked[i].Va, PAGE_SIZE, FALSE))
+                return FALSE;
+        }
+
+        for (UINT32 i = 0; i < table->DynPoolCount; i++)
+        {
+            if (table->DynPool[i].Va && !hostcr3_map_range(table->DynPool[i].Va, PAGE_SIZE, FALSE))
+                return FALSE;
+        }
+    }
+
+    return TRUE;
 }
 
 BOOLEAN
@@ -510,29 +856,26 @@ ept_init(VOID)
     if (!ept_build_mtrr_map())
         return FALSE;
 
-    //
-    // one shared page table for all vCPUs (identity map is identical);
-    // per-vCPU pointers are assigned below.
-    //
     g_ept->page_table = ept_alloc_identity_map();
     if (!g_ept->page_table)
         return FALSE;
 
-    UINT64 pml4_pa = va_to_pa(&g_ept->page_table->PML4[0]);
+    UINT64 pml4_pa = g_ept->page_table->PML4_Pa;
 
     for (UINT32 i = 0; i < g_cpu_count; i++)
     {
         EPT_POINTER eptp = {0};
-        eptp.MemoryType               = MEMORY_TYPE_WRITE_BACK;
+        eptp.MemoryType                = MEMORY_TYPE_WRITE_BACK;
         eptp.EnableAccessAndDirtyFlags = g_ept->ad_supported;
-        eptp.PageWalkLength           = 3;   // 4-level walk (value = levels - 1)
-        eptp.PageFrameNumber          = pml4_pa / PAGE_SIZE;
+        eptp.PageWalkLength            = 3;   // 4-level walk (value = levels - 1)
+        eptp.PageFrameNumber           = pml4_pa / PAGE_SIZE;
 
         g_vcpu[i].ept_pointer = eptp;         // Intel EPT
         g_vcpu[i].npt_cr3     = pml4_pa;      // AMD NPT
     }
 
-    DbgPrintEx(0, 0, "[hv] EPT/NPT initialized (shared table) for %u processors\n", g_cpu_count);
+    HV_LOG("EPT/NPT initialized (shared %s table) for %u processors\n",
+           g_ept->is_npt ? "NPT" : "EPT", g_cpu_count);
     return TRUE;
 }
 
@@ -541,7 +884,7 @@ ept_pml4_pa(VOID)
 {
     if (!g_ept || !g_ept->page_table)
         return 0;
-    return va_to_pa(&g_ept->page_table->PML4[0]);
+    return g_ept->page_table->PML4_Pa;
 }
 
 VOID
@@ -552,17 +895,7 @@ ept_destroy(VOID)
 
     if (g_ept->page_table)
     {
-        PVMM_EPT_PAGE_TABLE table = g_ept->page_table;
-
-        while (!IsListEmpty(&table->AllocList))
-        {
-            PLIST_ENTRY link = RemoveHeadList(&table->AllocList);
-            PVMM_EPT_ALLOC alloc = CONTAINING_RECORD(link, VMM_EPT_ALLOC, Link);
-            hv_free_contiguous(alloc->Page);
-            hv_pool_free(alloc);
-        }
-
-        hv_pool_free(table);
+        ept_free_page_table(g_ept->page_table);
         g_ept->page_table = NULL;
     }
 
@@ -574,28 +907,24 @@ BOOLEAN
 ept_split_large_page(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
 {
     PEPT_PML2_ENTRY target = ept_get_pml2(page_table, phys_addr);
-    if (!target || !target->LargePage)
+    if (!target || !ept_entry_is_large(target->AsUInt))
         return FALSE;
 
-    PVOID pml1 = ept_alloc_table(page_table);
+    UINT64 pml1_pa = 0;
+    PVOID  pml1    = ept_alloc_table(page_table, &pml1_pa);
     if (!pml1)
         return FALSE;
 
-    SIZE_T pfn2mb = target->PageFrameNumber;
+    SIZE_T  pfn2mb       = (SIZE_T)((phys_addr & ~(SIZE_2_MB - 1ULL)) / SIZE_2_MB);
+    PUINT64 pml1_entries = (PUINT64)pml1;
+
     for (UINT32 i = 0; i < 512; i++)
     {
-        EPT_PML1_ENTRY e = {0};
-        e.ReadAccess = e.WriteAccess = e.ExecuteAccess = 1;
-        e.MemoryType = ept_get_memory_type(pfn2mb * 512 + i, FALSE);
-        e.PageFrameNumber = pfn2mb * 512 + i;
-        ((PEPT_PML1_ENTRY)pml1)[i] = e;
+        SIZE_T pfn4k = pfn2mb * 512 + i;
+        pml1_entries[i] = ept_make_leaf_4kb(pfn4k, ept_get_memory_type(pfn4k, FALSE));
     }
 
-    EPT_PML2_POINTER p = {0};
-    p.ReadAccess = p.WriteAccess = p.ExecuteAccess = 1;
-    p.PageFrameNumber = va_to_pa(pml1) / PAGE_SIZE;
-    *(EPT_PML2_POINTER *)target = p;
-
+    *(PUINT64)target = ept_make_nonleaf(pml1_pa);
     return TRUE;
 }
 
@@ -610,22 +939,25 @@ ept_get_pml2(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
     if (!pml3)
         return NULL;
 
-    EPT_PML3_POINTER * pml3e = (EPT_PML3_POINTER *)((PUINT8)pml3 + pml3_idx * 8);
-    if (!pml3e->ReadAccess)
+    UINT64 pml3e = ((PUINT64)pml3)[pml3_idx];
+    if (!ept_entry_is_present(pml3e))
         return NULL;
 
-    PVOID pml2 = pa_to_va(pml3e->PageFrameNumber * PAGE_SIZE);
-    return (PEPT_PML2_ENTRY)((PUINT8)pml2 + pml2_idx * 8);
+    PVOID pml2 = ept_tracked_pa_to_va(page_table, ept_entry_next_pa(pml3e));
+    if (!pml2)
+        return NULL;
+
+    return (PEPT_PML2_ENTRY)&((PUINT64)pml2)[pml2_idx];
 }
 
 PEPT_PML1_ENTRY
 ept_get_pml1(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
 {
     PEPT_PML2_ENTRY pml2 = ept_get_pml2(page_table, phys_addr);
-    if (!pml2 || pml2->LargePage)
+    if (!pml2 || !ept_entry_is_present(pml2->AsUInt) || ept_entry_is_large(pml2->AsUInt))
         return NULL;
 
-    PVOID pml1 = pa_to_va(((EPT_PML2_POINTER *)pml2)->PageFrameNumber * PAGE_SIZE);
+    PVOID pml1 = ept_tracked_pa_to_va(page_table, ept_entry_next_pa(pml2->AsUInt));
     if (!pml1)
         return NULL;
 

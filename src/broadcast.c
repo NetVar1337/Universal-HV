@@ -1,74 +1,53 @@
 /*
-*   broadcast.c - dpc-based broadcast for multi-processor hv operations
+*   broadcast.c - multi-processor all-groups execution for hv init/teardown
 *
-*   KeGenericCallDpc only reaches the processors of the caller's group, so
-*   hv_generic_call_dpc_all_groups() (win_compat.c) switches the thread
-*   through every processor group. this makes the hypervisor work on
-*   machines with more than 64 logical processors (multi-group systems).
+*   uses documented Windows 7+ group-affinity APIs (KeGetProcessorNumberFromIndex
+*   + KeSetSystemGroupAffinityThread) via hv_for_each_cpu() so every logical
+*   processor across all processor groups (>64 LPs) is visited exactly once at
+*   DISPATCH_LEVEL with zero cross-core init races.
 */
 #include "hv.h"
 
 static VOID
-dpc_init_guest(
-    _In_ PKDPC  Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2)
+cpu_init_callback(ULONG cpu_index, PVOID context)
 {
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(DeferredContext);
+    UNREFERENCED_PARAMETER(cpu_index);
+    UNREFERENCED_PARAMETER(context);
 
-    //
-    // saves gprs + rflags, calls the backend's virtualize_cpu(rsp).
-    // on a successful launch/resume the CPU returns via the backend's
-    // restore-state trampoline.
-    //
     if (g_hv_backend == &g_vmx_backend)
         asm_vmx_save_state();
-    else
+    else if (g_hv_backend == &g_svm_backend)
         asm_svm_save_state();
-
-    KeSignalCallDpcSynchronize(SystemArgument2);
-    KeSignalCallDpcDone(SystemArgument1);
 }
 
 static VOID
-dpc_terminate_guest(
-    _In_ PKDPC  Dpc,
-    _In_opt_ PVOID DeferredContext,
-    _In_opt_ PVOID SystemArgument1,
-    _In_opt_ PVOID SystemArgument2)
+cpu_terminate_callback(ULONG cpu_index, PVOID context)
 {
-    UNREFERENCED_PARAMETER(Dpc);
-    UNREFERENCED_PARAMETER(DeferredContext);
+    UNREFERENCED_PARAMETER(context);
 
     //
-    // only issue the terminate call on processors that were actually
-    // virtualized — VMCALL/VMMCALL on a non-virtualized cpu #UDs.
+    // only issue VMCALL/VMMCALL on processors that were actually virtualized —
+    // executing it on a non-virtualized CPU raises #UD.
     //
+    if (g_vcpu && cpu_index < g_vcpu_capacity && g_vcpu[cpu_index].launched)
     {
-        ULONG idx = hv_current_processor_index();
-        if (g_vcpu && idx < g_cpu_count && g_vcpu[idx].launched)
-        {
-            if (g_hv_backend == &g_vmx_backend)
-                asm_vmx_vmcall(VMCALL_VMXOFF, 0, 0, 0);
-            else
-                asm_svm_vmcall(VMCALL_VMXOFF, 0, 0, 0);
-        }
-    }
+        if (g_hv_backend == &g_vmx_backend)
+            asm_vmx_vmcall(VMCALL_VMXOFF, 0, 0, 0);
+        else if (g_hv_backend == &g_svm_backend)
+            asm_svm_vmcall(VMCALL_VMXOFF, 0, 0, 0);
 
-    KeSignalCallDpcSynchronize(SystemArgument2);
-    KeSignalCallDpcDone(SystemArgument1);
+        g_vcpu[cpu_index].launched = FALSE;
+    }
 }
 
 VOID
 broadcast_virtualize_all(VOID)
 {
-    hv_generic_call_dpc_all_groups(dpc_init_guest, NULL);
+    hv_for_each_cpu(cpu_init_callback, NULL);
 }
 
 VOID
 broadcast_terminate_all(VOID)
 {
-    hv_generic_call_dpc_all_groups(dpc_terminate_guest, NULL);
+    hv_for_each_cpu(cpu_terminate_callback, NULL);
 }

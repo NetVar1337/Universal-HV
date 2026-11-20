@@ -190,6 +190,7 @@
 #define SVM_EXIT_CR8_WRITE_TRAP     0x098
 #define SVM_EXIT_INVPCID            0x0A2
 #define SVM_EXIT_NPF                0x400   // nested page fault
+#define SVM_EXIT_INVALID            ((UINT64)-1)
 
 //
 // exit info 1 register selector mask (CR/DR exits)
@@ -198,11 +199,22 @@
 
 //
 // segment descriptor in VMCB save area (16 bytes)
+// NOTE: AMD SVM compressed 16-bit Attrib layout (APM Vol 2 Table 15-2):
+//   bits  3:0  = Type
+//   bit   4    = S (System)
+//   bits  6:5  = DPL
+//   bit   7    = P (Present)
+//   bit   8    = AVL
+//   bit   9    = L (Long mode)
+//   bit  10    = D/B
+//   bit  11    = G (Granularity)
+//   bits 15:12 = Reserved (0)
+// This differs from Intel VMX, where AVL/L/DB/G sit at bits 15:12!
 //
 #pragma pack(push, 1)
 typedef struct _SVM_SEGMENT {
     UINT16 Selector;
-    UINT16 Attrib;      // same 16-bit access-rights layout as VMX
+    UINT16 Attrib;
     UINT32 Limit;
     UINT64 Base;
 } SVM_SEGMENT, *PSVM_SEGMENT;
@@ -239,37 +251,38 @@ typedef struct _SVM_SAVE_AREA {
     UINT64     SCet;            // 0x5E0
     UINT8      Reserved4[24];   // 0x5E8
     UINT64     Rax;             // 0x5F8
+    UINT64     Star;            // 0x600
+    UINT64     Lstar;           // 0x608
+    UINT64     Cstar;           // 0x610
+    UINT64     SfMask;          // 0x618
+    UINT64     KernelGsBase;    // 0x620
+    UINT64     SysenterCs;      // 0x628
+    UINT64     SysenterEsp;     // 0x630
+    UINT64     SysenterEip;     // 0x638
+    UINT64     Cr2;             // 0x640
+    UINT8      Reserved5[32];   // 0x648
+    UINT64     GPat;            // 0x668
 } SVM_SAVE_AREA, *PSVM_SAVE_AREA;
 
 //
 // full VMCB: control area (1KB) + save area (3KB) in one 4KB page
 //
 typedef struct _VMCB {
-    UINT8      Control[0x400];
+    UINT8         Control[0x400];
     SVM_SAVE_AREA Save;
 } VMCB, *PVMCB;
-
-//
-// host save area (pointed to by MSR_VM_HSAVE_PA) uses the same layout as
-// the save area for the fields VMRUN saves/restores.
-//
-typedef SVM_SAVE_AREA SVM_HOST_SAVE_AREA, *PSVM_HOST_SAVE_AREA;
-
-#define SVM_HSAVE_OFF_CS        0x10
-#define SVM_HSAVE_OFF_SS        0x20
-#define SVM_HSAVE_OFF_ES        0x00
-#define SVM_HSAVE_OFF_DS        0x30
-#define SVM_HSAVE_OFF_GDTR      0x60
-#define SVM_HSAVE_OFF_IDTR      0x80
-#define SVM_HSAVE_OFF_EFER      0xD0
-#define SVM_HSAVE_OFF_CR4       0x148
-#define SVM_HSAVE_OFF_CR3       0x150
-#define SVM_HSAVE_OFF_CR0       0x158
-#define SVM_HSAVE_OFF_RFLAGS    0x170
-#define SVM_HSAVE_OFF_RIP       0x178
-#define SVM_HSAVE_OFF_RSP       0x1D8
-#define SVM_HSAVE_OFF_RAX       0x1F8
 #pragma pack(pop)
+
+//
+// pack VMX-format 32-bit segment access rights into AMD VMCB 16-bit Attrib
+//
+static __forceinline UINT16
+svm_pack_attrib(UINT32 vmx_ar)
+{
+    UINT16 low  = (UINT16)(vmx_ar & 0x00FFU);          // Type/S/DPL/P -> bits 7:0
+    UINT16 high = (UINT16)((vmx_ar >> 4) & 0x0F00U);   // AVL/L/DB/G (bits 15:12) -> bits 11:8
+    return (UINT16)(low | high);
+}
 
 //
 // helpers to poke control-area fields
@@ -281,19 +294,27 @@ svm_set_intercept(PVMCB vmcb, UINT32 bit)
 }
 
 static __forceinline VOID
+svm_clear_intercept(PVMCB vmcb, UINT32 bit)
+{
+    ((PUINT32)vmcb->Control)[bit >> 5] &= ~(1U << (bit & 31));
+}
+
+static __forceinline VOID
 svm_clear_all_intercepts(PVMCB vmcb)
 {
     RtlZeroMemory(vmcb->Control, 0x18);     // words 0-5 only
-    //
-    // leave IOPM/MSRPM/TSC/ASID/TLB/int/exit fields intact — clearing
-    // intercepts only stops #VMEXITs, the rest of the control area stays.
-    //
 }
 
 static __forceinline UINT64
 svm_ctrl_read(PVMCB vmcb, UINT32 offset)
 {
     return *(UINT64 *)((PUINT8)vmcb->Control + offset);
+}
+
+static __forceinline UINT32
+svm_ctrl_read32(PVMCB vmcb, UINT32 offset)
+{
+    return *(UINT32 *)((PUINT8)vmcb->Control + offset);
 }
 
 static __forceinline VOID
@@ -306,4 +327,46 @@ static __forceinline VOID
 svm_ctrl_write32(PVMCB vmcb, UINT32 offset, UINT32 value)
 {
     *(UINT32 *)((PUINT8)vmcb->Control + offset) = value;
+}
+
+//
+// program AMD MSRPM (8KB, 2 bits per MSR: bit 0 = RDMSR, bit 1 = WRMSR).
+// AMD APM Vol 2 Section 15.11:
+//   0x00000000 - 0x00001FFF -> byte offset 0x0000
+//   0xC0000000 - 0xC0001FFF -> byte offset 0x0800
+//   0xC0010000 - 0xC0011FFF -> byte offset 0x1000
+//
+static __forceinline VOID
+svm_set_msrpm_bit(PUINT8 msrpm, UINT32 msr, BOOLEAN intercept_read, BOOLEAN intercept_write)
+{
+    UINT32 base_offset;
+    UINT32 index;
+
+    if (msr <= 0x00001FFF)
+    {
+        base_offset = 0x0000;
+        index = msr;
+    }
+    else if (msr >= 0xC0000000 && msr <= 0xC0001FFF)
+    {
+        base_offset = 0x0800;
+        index = msr - 0xC0000000;
+    }
+    else if (msr >= 0xC0010000 && msr <= 0xC0011FFF)
+    {
+        base_offset = 0x1000;
+        index = msr - 0xC0010000;
+    }
+    else
+    {
+        return; // MSRs outside these ranges always intercept when MSR_PROT is set
+    }
+
+    UINT32 byte_idx = base_offset + (index / 4);
+    UINT32 bit_shift = (index % 4) * 2;
+
+    if (intercept_read)
+        msrpm[byte_idx] |= (UINT8)(1U << bit_shift);
+    if (intercept_write)
+        msrpm[byte_idx] |= (UINT8)(1U << (bit_shift + 1));
 }

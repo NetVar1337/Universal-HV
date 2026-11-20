@@ -31,6 +31,7 @@
 
 #define IA32_FEATURE_CONTROL           0x0000003A
 #define IA32_DEBUGCTL                  0x000001D9
+#define IA32_PAT                       0x00000277
 #define IA32_SYSENTER_CS               0x00000174
 #define IA32_SYSENTER_ESP              0x00000175
 #define IA32_SYSENTER_EIP              0x00000176
@@ -291,7 +292,19 @@ typedef union _CR4 {
     };
 } CR4;
 
+#define CR4_DE_FLAG         (1ULL << 3)
+#define CR4_PAE_FLAG        (1ULL << 5)
+#define CR4_PCE_FLAG        (1ULL << 8)
+#define CR4_LA57_FLAG       (1ULL << 12)
 #define CR4_VMX_ENABLE_FLAG (1ULL << 13)
+#define CR4_PCIDE_FLAG      (1ULL << 17)
+#define CR4_OSXSAVE_FLAG    (1ULL << 18)
+
+#define CR0_PE_FLAG         (1ULL << 0)
+#define CR0_NW_FLAG         (1ULL << 29)
+#define CR0_CD_FLAG         (1ULL << 30)
+#define CR0_PG_FLAG         (1ULL << 31)
+#define CR0_RESERVED_HIGH   0xFFFFFFFF00000000ULL
 
 typedef union _CR_FIXED {
     UINT64 Flags;
@@ -390,6 +403,7 @@ typedef union _MSR {
 #define VMCS_CTRL_VMENTRY_MSR_LOAD_ADDRESS           0x0000200A
 #define VMCS_CTRL_TSC_OFFSET                         0x00002010
 #define VMCS_CTRL_EPT_POINTER                        0x0000201A
+#define VMCS_CTRL_XSS_EXITING_BITMAP                 0x0000202C
 #define VMCS_CTRL_PML_ADDRESS                        0x0000200E
 
 //
@@ -1113,6 +1127,21 @@ typedef union _VMENTRY_INTERRUPT_INFORMATION {
 #define GUEST_ACTIVITY_STATE_HLT            1
 #define GUEST_ACTIVITY_STATE_SHUTDOWN       2
 #define GUEST_ACTIVITY_STATE_WAIT_FOR_SIPI  3
+
+//
+// AMD NPT (standard x86-64 long-mode page table format)
+//
+#define NPT_PTE_PRESENT             (1ULL << 0)
+#define NPT_PTE_WRITE               (1ULL << 1)
+#define NPT_PTE_USER                (1ULL << 2)
+#define NPT_PTE_PWT                 (1ULL << 3)
+#define NPT_PTE_PCD                 (1ULL << 4)
+#define NPT_PTE_ACCESSED            (1ULL << 5)
+#define NPT_PTE_DIRTY               (1ULL << 6)
+#define NPT_PTE_LARGE_PAGE          (1ULL << 7)
+#define NPT_PTE_PAT_4K              (1ULL << 7)
+#define NPT_PTE_PAT_2M              (1ULL << 12)
+#define NPT_PTE_PFN_MASK            0x000FFFFFFFFFF000ULL
 
 //
 // VPID Tag

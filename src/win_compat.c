@@ -21,8 +21,8 @@ win_compat_init(VOID)
 
     g_win_compat_ready = TRUE;
 
-    DbgPrintEx(0, 0, "[hv] win_compat: ExAllocatePool2 %s\n",
-             g_pfn_ExAllocatePool2 ? "available (2004+)" : "NOT found, using ExAllocatePoolWithTag fallback");
+    HV_LOG("win_compat: ExAllocatePool2 %s\n",
+           g_pfn_ExAllocatePool2 ? "available (2004+)" : "NOT found, using ExAllocatePoolWithTag fallback");
     return TRUE;
 }
 
@@ -32,11 +32,10 @@ hv_pool_alloc(SIZE_T size)
     if (g_pfn_ExAllocatePool2)
         return g_pfn_ExAllocatePool2(POOL_FLAG_NON_PAGED, size, HV_POOL_TAG);
 
-    //
-    // Windows 7 / 8 / 8.1 / early Win10: NonPagedPool is NX on Win8+,
-    // and we never execute pool memory anyway.
-    //
+#pragma warning(push)
+#pragma warning(disable : 4996)
     return ExAllocatePoolWithTag(NonPagedPool, size, HV_POOL_TAG);
+#pragma warning(pop)
 }
 
 VOID
@@ -51,7 +50,7 @@ PVOID
 hv_alloc_contiguous(SIZE_T size)
 {
     PHYSICAL_ADDRESS max_phys;
-    max_phys.QuadPart = MAXULONG64;
+    max_phys.QuadPart = (LONGLONG)MAXULONG64;
     return MmAllocateContiguousMemory(size, max_phys);
 }
 
@@ -62,23 +61,46 @@ hv_free_contiguous(PVOID p)
         MmFreeContiguousMemory(p);
 }
 
+PVOID
+hv_alloc_aligned_contiguous(SIZE_T size, SIZE_T alignment, PVOID *raw_out)
+{
+    if (!raw_out || alignment == 0 || (alignment & (alignment - 1)) != 0)
+        return NULL;
+
+    *raw_out = NULL;
+
+    //
+    // over-allocate by alignment bytes so we can round the VA up to an exact
+    // power-of-2 boundary (MmAllocateContiguousMemory already aligns to 4KB,
+    // and larger alignments like 32KB for VMM stacks are guaranteed here).
+    //
+    SIZE_T alloc_size = size + alignment;
+    PVOID raw = hv_alloc_contiguous(alloc_size);
+    if (!raw)
+        return NULL;
+
+    ULONG_PTR aligned = ((ULONG_PTR)raw + (alignment - 1)) & ~(alignment - 1);
+    *raw_out = raw;
+    return (PVOID)aligned;
+}
+
 ULONG
 hv_total_processor_count(VOID)
 {
-    //
-    // ALL_PROCESSOR_GROUPS (0xFFFF) — total logical processors across all
-    // groups. on single-group machines this equals KeQueryActiveProcessorCount(0).
-    //
     return KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+}
+
+ULONG
+hv_max_processor_count(VOID)
+{
+    ULONG max_cpus = KeQueryMaximumProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    ULONG active   = hv_total_processor_count();
+    return (max_cpus >= active) ? max_cpus : active;
 }
 
 ULONG
 hv_current_processor_index(VOID)
 {
-    //
-    // KeGetCurrentProcessorNumberEx returns the SYSTEM-WIDE processor index
-    // (dense 0..N-1 across all groups), which is what we use to index g_vcpu.
-    //
     return KeGetCurrentProcessorNumberEx(NULL);
 }
 
@@ -90,31 +112,31 @@ hv_active_group_count(VOID)
 }
 
 VOID
-hv_generic_call_dpc_all_groups(PHV_DPC_ROUTINE Routine, PVOID Context)
+hv_for_each_cpu(PHV_PER_CPU_CALLBACK callback, PVOID context)
 {
-    USHORT groups = hv_active_group_count();
+    ULONG count = hv_total_processor_count();
 
-    if (groups <= 1)
+    for (ULONG i = 0; i < count; i++)
     {
-        KeGenericCallDpc((PKDEFERRED_ROUTINE)Routine, Context);
-        return;
-    }
+        PROCESSOR_NUMBER proc_num;
+        GROUP_AFFINITY   affinity;
+        GROUP_AFFINITY   prev_affinity;
+        KIRQL            old_irql;
 
-    //
-    // KeGenericCallDpc only signals the processors of the caller's current
-    // group. to reach every logical processor on multi-group machines
-    // (>64 logical processors), switch the current thread into each group
-    // and issue the broadcast there.
-    //
-    for (USHORT g = 0; g < groups; g++)
-    {
-        GROUP_AFFINITY ga;
-        RtlZeroMemory(&ga, sizeof(ga));
-        ga.Group = g;
-        ga.Mask  = (KAFFINITY)-1;   // masked down to the group by the kernel
-        KeSetSystemAffinityThreadEx(&ga);
-        KeGenericCallDpc((PKDEFERRED_ROUTINE)Routine, Context);
-    }
+        if (!NT_SUCCESS(KeGetProcessorNumberFromIndex(i, &proc_num)))
+            continue;
 
-    KeRevertToUserAffinityThread();
+        RtlZeroMemory(&affinity, sizeof(affinity));
+        RtlZeroMemory(&prev_affinity, sizeof(prev_affinity));
+        affinity.Group = proc_num.Group;
+        affinity.Mask  = (KAFFINITY)(1ULL << proc_num.Number);
+
+        KeSetSystemGroupAffinityThread(&affinity, &prev_affinity);
+
+        KeRaiseIrql(DISPATCH_LEVEL, &old_irql);
+        callback(i, context);
+        KeLowerIrql(old_irql);
+
+        KeRevertToUserGroupAffinityThread(&prev_affinity);
+    }
 }

@@ -33,13 +33,14 @@ typedef enum _HV_VENDOR {
 #define CPUID_HYPERVISOR_BIT        31      // CPUID.1:ECX[31] — hypervisor present
 
 //
-// AMD SVM MSRs / bits
+// AMD SVM MSRs / bits (AMD APM Vol 2 Section 15.30.1)
 //
 #define MSR_EFER                    0xC0000080
 #define EFER_SVME                   (1ULL << 12)
 #define MSR_VM_CR                   0xC0010114
 #define MSR_VM_HSAVE_PA             0xC0010117
-#define VM_CR_SVM_DIS               (1ULL << 0)     // BIOS-locked SVM disable
+#define VM_CR_LOCK                  (1ULL << 3)     // locks SVMDIS
+#define VM_CR_SVM_DIS               (1ULL << 4)     // BIOS-locked SVM disable (bit 4, NOT bit 0)
 
 //
 // CPUID.8000000A EDX feature bits
@@ -57,6 +58,11 @@ typedef struct _CPU_CAPS {
     UINT32    max_std_leaf;
     UINT32    max_ext_leaf;
     UINT8     maxphyaddr;               // physical address width in bits
+    UINT8     pmu_gp_counters;          // CPUID.0Ah:EAX[15:8] (Intel)
+    UINT8     pmu_fixed_counters;       // CPUID.0Ah:EDX[4:0]  (Intel)
+    UINT8     _pad0;
+
+    UINT64    cr4_valid_mask;           // architectural valid CR4 bits on this CPU
 
     BOOLEAN   hypervisor_present;       // already running under a hypervisor (e.g. Hyper-V)
 
@@ -82,11 +88,11 @@ extern CPU_CAPS g_cpu;
 BOOLEAN cpuinfo_init(VOID);
 
 //
-// intel: make sure VMX can be enabled outside SMX. if IA32_FEATURE_CONTROL
-// is unlocked we set EnableVmxOutsideSmx + Lock ourselves (some firmware
-// leaves it unlocked). returns FALSE if VMX is locked off (e.g. Hyper-V
-// owns it or BIOS disabled VT-x) — the caller then fails gracefully.
+// intel: make sure VMX can be enabled outside SMX on the current logical
+// processor. IA32_FEATURE_CONTROL is per-logical-processor, so call this
+// during initial probing AND on each logical processor before VMXON.
 //
+BOOLEAN cpuinfo_vmx_enable_current_cpu(VOID);
 BOOLEAN cpuinfo_vmx_enable(VOID);
 
 //

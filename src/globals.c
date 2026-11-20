@@ -6,10 +6,11 @@
 VIRTUAL_MACHINE_STATE *g_vcpu               = NULL;
 EPT_STATE *g_ept                            = NULL;
 UINT32 g_cpu_count                          = 0;
-UINT64 g_system_cr3                         = 0;
-UINT64 *g_msr_bitmap_invalid                = NULL;
+UINT32 g_vcpu_capacity                      = 0;
 HOST_IDT_STATE g_host_idt                   = {0};
-volatile LONG g_host_nmi_pending            = 0;
+HOST_FAULT_INFO g_host_fault_info           = {0};
+PVOID g_driver_base                         = NULL;
+ULONG g_driver_size                         = 0;
 
 const HV_BACKEND *g_hv_backend              = NULL;
 BOOLEAN g_hv_active                         = FALSE;   // TRUE once all cpus are virtualized

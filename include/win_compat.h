@@ -8,11 +8,10 @@
 *   - ExAllocatePool2 only exists on Windows 10 2004+; it is resolved
 *     dynamically and falls back to ExAllocatePoolWithTag(NonPagedPool)
 *     on older systems.
-*   - processor-group APIs (KeQueryActiveProcessorCountEx, ...) exist since
-*     Windows 7; they are linked directly and additionally used to support
-*     machines with more than 64 logical processors (multiple groups).
-*   - no hardcoded structure offsets are used anywhere in this project, so
-*     build-to-build kernel layout changes do not matter.
+*   - processor-group APIs (KeQueryActiveProcessorCountEx,
+*     KeGetProcessorNumberFromIndex, KeSetSystemGroupAffinityThread, ...)
+*     exist since Windows 7 and support multi-group machines (>64 LPs).
+*   - no hardcoded structure offsets are used anywhere in this project.
 */
 #pragma once
 
@@ -28,33 +27,6 @@ PPHYSICAL_MEMORY_RANGE
 MmGetPhysicalMemoryRanges(VOID);
 
 //
-// KeGenericCallDpc family — not declared in all WDK header versions we
-// target (stable since Windows Vista); declared here once for all modules.
-//
-NTKERNELAPI
-_IRQL_requires_max_(APC_LEVEL)
-_IRQL_requires_min_(PASSIVE_LEVEL)
-_IRQL_requires_same_
-VOID
-KeGenericCallDpc(
-    _In_ PKDEFERRED_ROUTINE Routine,
-    _In_opt_ PVOID          Context);
-
-NTKERNELAPI
-_IRQL_requires_(DISPATCH_LEVEL)
-_IRQL_requires_same_
-VOID
-KeSignalCallDpcDone(
-    _In_ PVOID SystemArgument1);
-
-NTKERNELAPI
-_IRQL_requires_(DISPATCH_LEVEL)
-_IRQL_requires_same_
-LOGICAL
-KeSignalCallDpcSynchronize(
-    _In_ PVOID SystemArgument2);
-
-//
 // dynamically resolved ExAllocatePool2 (Windows 10 2004+, WDK 19041+)
 //
 typedef PVOID (NTAPI *PFN_ExAllocatePool2)(POOL_FLAGS Flags, SIZE_T NumberOfBytes, ULONG Tag);
@@ -68,24 +40,34 @@ PVOID hv_pool_alloc(SIZE_T size);
 VOID  hv_pool_free(PVOID p);
 
 //
-// contiguous physically-aligned allocation (VMXON/VMCS/VMCB/NPT tables)
+// contiguous physically-aligned allocation (VMXON/VMCS/VMCB/EPT/NPT/bitmaps)
 //
 PVOID hv_alloc_contiguous(SIZE_T size);
 VOID  hv_free_contiguous(PVOID p);
 
 //
+// allocate contiguous memory with explicit power-of-2 VA+PA alignment
+// (e.g., 32KB alignment for per-vCPU VMM stacks so NMI handlers can locate
+// the stack top directly from RSP). returns aligned pointer and stores the
+// raw pointer in *raw_out for hv_free_contiguous().
+//
+PVOID hv_alloc_aligned_contiguous(SIZE_T size, SIZE_T alignment, PVOID *raw_out);
+
+//
 // processor enumeration across ALL processor groups (multi-group machines
 // with >64 logical processors are fully supported)
 //
-ULONG hv_total_processor_count(VOID);        // KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS)
-ULONG hv_current_processor_index(VOID);      // system-wide index 0..N-1
+ULONG  hv_total_processor_count(VOID);       // KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS)
+ULONG  hv_max_processor_count(VOID);         // KeQueryMaximumProcessorCountEx(ALL_PROCESSOR_GROUPS)
+ULONG  hv_current_processor_index(VOID);     // system-wide index 0..N-1
 USHORT hv_active_group_count(VOID);
 
 //
-// KeGenericCallDpc broadcasts only to the caller's group. this helper runs
-// the DPC on every group by switching thread affinity group by group.
+// execute a callback at DISPATCH_LEVEL on every active logical processor
+// across all processor groups using documented group-affinity APIs
+// (KeGetProcessorNumberFromIndex + KeSetSystemGroupAffinityThread).
 // must be called at PASSIVE_LEVEL.
 //
-typedef VOID (*PHV_DPC_ROUTINE)(PKDPC Dpc, PVOID DeferredContext, PVOID SystemArgument1, PVOID SystemArgument2);
+typedef VOID (*PHV_PER_CPU_CALLBACK)(ULONG cpu_index, PVOID context);
 
-VOID hv_generic_call_dpc_all_groups(PHV_DPC_ROUTINE Routine, PVOID Context);
+VOID hv_for_each_cpu(PHV_PER_CPU_CALLBACK callback, PVOID context);

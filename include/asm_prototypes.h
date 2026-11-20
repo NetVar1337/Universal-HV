@@ -48,7 +48,7 @@ extern VOID asm_vmx_save_state(VOID);
 extern VOID asm_vmx_restore_state(VOID);
 
 //
-// VM-exit handler entry point (asm_vmexit_handler.asm)
+// VM-exit handler entry point (AsmVmexitHandler.asm)
 //
 extern VOID asm_vmexit_handler(VOID);
 
@@ -64,16 +64,19 @@ extern UINT8 asm_invvpid(UINT32 type, PVOID descriptor);
 extern VOID asm_host_nmi_handler(VOID);
 extern VOID asm_host_df_handler(VOID);
 extern VOID asm_host_gp_handler(VOID);
+extern VOID asm_host_pf_handler(VOID);
 extern VOID asm_host_default_handler(VOID);
 
 //
 // AMD SVM routines (AsmSvm.asm)
 //
 extern VOID asm_svm_enable(VOID);
+extern VOID asm_svm_disable(VOID);
 extern VOID asm_clgi(VOID);
 extern VOID asm_stgi(VOID);
+extern VOID asm_svm_vmsave(UINT64 vmcb_pa);
+extern VOID asm_svm_vmload(UINT64 vmcb_pa);
 extern NTSTATUS asm_svm_vmcall(UINT64 vmcall_num, UINT64 param1, UINT64 param2, UINT64 param3);
 extern VOID asm_svm_save_state(VOID);
 extern VOID asm_svm_restore_state(VOID);
-extern VOID asm_svm_vmrun(UINT64 vmcb_pa);
-extern VOID asm_svmexit_handler(VOID);
+extern VOID asm_svm_launch_loop(PVOID vcpu, UINT64 vmm_stack_top, UINT64 host_cr3, UINT64 host_idtr_base);
