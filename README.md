@@ -4,9 +4,12 @@
   <img src="logo.png" alt="Ophion logo" width="640">
 </div>
 
-Ophion is an experimental Intel VT-x Type-2 hypervisor for Windows x64. It
-virtualizes an already-running Windows system and is intended as a
-systems-programming and virtualization research project.
+Ophion is an experimental Type-2 hypervisor for Windows x64. It virtualizes an
+already-running Windows system using the CPU's hardware virtualization
+extension — **Intel VT-x (VMX)** on Intel CPUs and **AMD-V (SVM)** on AMD
+CPUs — and is intended as a systems-programming and virtualization research
+project. The backend is selected automatically at load time from the CPU
+vendor (`src/cpuinfo.c`, `include/hv_backend.h`).
 
 > **Experimental kernel software:** Hypervisor and kernel-driver defects can
 > crash or corrupt the system. Build and evaluate Ophion only on a dedicated
@@ -19,21 +22,37 @@ systems-programming and virtualization research project.
 This project is under active development and has only been exercised on the
 hardware and Windows configuration listed below. It is not production-ready;
 correctness, stability, and compatibility on other systems are not guaranteed.
+The [compatibility table](#compatibility) above describes the design targets.
 
 ## Technical overview
 
-- **Per-processor virtualization:** Uses a DPC broadcast to initialize and
-  terminate VMX on logical processors.
-- **Extended Page Tables (EPT):** Builds an identity map using 2 MB pages,
-  derives memory types from MTRRs, and supports splitting large pages.
+- **Dual backend:** Intel VT-x (VMX) and AMD-V (SVM) backends behind a common
+  `HV_BACKEND` vtable, selected at load time from the CPU vendor. Both
+  virtualize every logical processor in every processor group.
+- **Per-processor virtualization:** Uses a group-aware DPC broadcast to
+  initialize and terminate virtualization on all logical processors, including
+  multi-group machines with more than 64 logical processors.
+- **EPT / NPT:** Builds a dynamic identity map (2 MB pages, split on MTRR/RAM
+  boundaries) from the machine's actual RAM ranges, so systems with more than
+  512 GB of RAM and LA57 systems are covered. Memory types derive from MTRRs;
+  non-RAM regions are uncacheable. The same table serves as AMD NPT.
 - **VMX lifecycle:** Allocates and configures VMXON regions and VMCS state,
   launches guests, and restores guest state during teardown.
-- **VM-exit and event handling:** Implements handlers for selected CPUID,
-  control-register, debug-register, MSR, EPT, interrupt, and exception events.
+- **SVM lifecycle:** Allocates VMCB + host save area + IOPM/MSRPM per logical
+  processor, programs intercepts, and runs VMRUN; #VMEXIT is dispatched by
+  `svm_exit_handler`.
+- **VM-exit / #VMEXIT handling:** Handlers for selected CPUID,
+  control-register, debug-register, MSR, EPT/NPT, interrupt, and exception
+  events on both backends.
 - **Host-state isolation:** Includes private host page tables, an IDT, and
-  per-processor GDTs for VMX-root operation.
-- **Capability-aware controls:** Checks processor capabilities and configures
-  supported VMX, EPT, and VPID features.
+  per-processor GDTs for VMX-root / SVM host operation.
+- **Capability-aware controls:** All VMX control bits are adjusted against the
+  CPU's capability MSRs; VPID/EPT/secondary-controls use is verified at
+  runtime and dependent paths (e.g. INVVPID) are guarded. Machines without
+  the required features fail cleanly at load with a diagnostic.
+- **Version portability:** No hardcoded kernel structure offsets;
+  `ExAllocatePool2` is resolved dynamically with an `ExAllocatePoolWithTag`
+  fallback, so the driver loads on Windows 7 x64 through Windows 11 24H2.
 
 The implementation also contains experimental build-time options that alter
 selected guest-visible processor state. These are provided for controlled
@@ -49,24 +68,43 @@ third-party product.
 | `include/ia32.h` | Intel architecture definitions |
 | `include/stealth.h` | Build-time feature options and related state |
 | `include/asm_prototypes.h` | Prototypes for assembly routines |
-| `src/driver.c` | Windows driver entry point, device setup, and status IOCTL |
-| `src/vmx.c` | VMX initialization, VMCS configuration, and lifecycle |
-| `src/vmexit.c` | VM-exit dispatch and instruction handling |
-| `src/ept.c` | EPT setup, memory typing, and page management |
+| `src/driver.c` | Windows driver entry point, backend selection, device setup, and status IOCTLs |
+| `src/cpuinfo.c` | CPU vendor detection and virtualization capability probing (Intel/AMD) |
+| `src/win_compat.c` | Windows version compatibility layer (dynamic APIs, pool wrappers, processor-group broadcast) |
+| `src/vmx.c` | Intel VMX backend: VMXON, VMCS configuration, and lifecycle |
+| `src/svm.c` | AMD SVM backend: VMCB/VMRUN, NPT, and #VMEXIT handling |
+| `src/vmexit.c` | VMX VM-exit dispatch and instruction handling |
+| `src/ept.c` | Dynamic identity-mapped EPT/NPT (RAM-range driven), memory typing, page splitting |
 | `src/events.c` | Exception and interrupt injection |
-| `src/broadcast.c` | Multi-processor initialization and termination |
+| `src/broadcast.c` | All-groups DPC broadcast for initialization and termination |
 | `src/hostcr3.c` | Private host page-table construction |
 | `src/hostidt.c` | Private host IDT construction |
 | `src/hostgdt.c` | Per-processor private host GDT construction |
 | `src/stealth.c` | CPUID cache initialization and processor-state validation |
 | `src/util.c`, `src/globals.c` | Shared utilities and global state |
-| `asm/` | x64 MASM routines for VMX operations, context handling, and segments |
+| `asm/` | x64 MASM routines for VMX/SVM operations, context handling, and segments |
+| `include/hv_backend.h` | Backend abstraction (VMX vs SVM vtable) |
+| `include/svm.h` | AMD SVM VMCB layout, exit codes, and intercept definitions |
+
+## Compatibility
+
+Ophion is designed to run on a wide range of machines and Windows versions:
+
+| Dimension | Support |
+|---|---|
+| CPU vendor | Intel (VT-x/VMX **and** EPT required) and AMD (SVM **and** nested paging required). Other vendors: clean load failure with `STATUS_NOT_SUPPORTED`. |
+| CPU models | Intel Nehalem (2008) and newer; AMD Family 10h (2007) and newer. CPUs without EPT/NPT fail cleanly at load. |
+| Logical processors | Any count, including multi-group systems with more than 64 logical processors (all processor groups are virtualized via per-group DPC broadcast). |
+| Physical memory | Any size. The identity-mapped EPT/NPT is built dynamically from the actual RAM ranges (`MmGetPhysicalMemoryRanges`), so machines with more than 512 GB RAM and LA57 (5-level paging) systems work. Physical addresses up to 48 bits (256 TB) are mapped by the 4-level walk. |
+| Firmware | VT-x/SVM must be enabled in BIOS/UEFI. If `IA32_FEATURE_CONTROL` is unlocked, Ophion enables VMX itself; if it is locked off (or Hyper-V/VBS owns VMX), the driver fails cleanly without touching the system. AMD SVM locked via `VM_CR` fails cleanly. |
+| Windows | x64 Windows 7 SP1 through Windows 11 24H2 and Server 2016–2025. `ExAllocatePool2` is resolved dynamically (falls back to `ExAllocatePoolWithTag` on pre-2004 systems); no hardcoded kernel structure offsets are used anywhere, so build-to-build layout changes do not matter. Test signing must be enabled (`bcdedit /set testsigning on`) and Secure Boot off (or the test certificate enrolled), since this is a development-signed driver. On Windows 11 with HVCI/Memory Integrity enabled, unsigned or test-signed drivers are blocked by policy — disable HVCI to load a development build. |
+| Running under a hypervisor | If the machine is itself a VM with nested virtualization exposed (e.g. Hyper-V with nested virt), Ophion can virtualize that guest too. If Hyper-V is active on the host without nested VT-x/SVM exposed, Ophion fails cleanly. |
 
 ## Requirements
 
-- x64 Intel processor with Intel VT-x and the required EPT capabilities enabled
-  in firmware.
-- Windows x64.
+- x64 CPU with hardware virtualization enabled in firmware (Intel VT-x + EPT,
+  or AMD SVM + NPT).
+- Windows x64 (see compatibility table above).
 - Visual Studio 2022 with the Desktop development with C++ workload.
 - Windows Driver Kit (WDK) and Windows SDK `10.0.26100.0`.
 - x64 MASM tools installed with Visual Studio.
@@ -97,7 +135,8 @@ validated across a broad range of systems.
 - Windows 10 x64
 
 This is a limited test report, not a supported-hardware list or a guarantee of
-compatibility.
+compatibility. The compatibility table above describes the design targets;
+please report machines/OS builds where Ophion fails to load or virtualize.
 
 ## Further reading
 

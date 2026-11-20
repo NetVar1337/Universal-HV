@@ -40,6 +40,27 @@
     <ClCompile Include="src\util.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\stealth.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hostcr3.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hostidt.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hostgdt.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\win_compat.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\cpuinfo.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\svm.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
 
   <ItemGroup>
@@ -53,6 +74,21 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\asm_prototypes.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="include\stealth.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="include\win_compat.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="include\cpuinfo.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="include\svm.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="include\hv_backend.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -74,6 +110,12 @@
       <Filter>Assembly Files</Filter>
     </MASM>
     <MASM Include="asm\AsmVmxIntrinsics.asm">
+      <Filter>Assembly Files</Filter>
+    </MASM>
+    <MASM Include="asm\AsmHostIdt.asm">
+      <Filter>Assembly Files</Filter>
+    </MASM>
+    <MASM Include="asm\AsmSvm.asm">
       <Filter>Assembly Files</Filter>
     </MASM>
   </ItemGroup>

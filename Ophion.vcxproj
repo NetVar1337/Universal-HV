@@ -114,6 +114,9 @@
     <ClCompile Include="src\hostcr3.c" />
     <ClCompile Include="src\hostidt.c" />
     <ClCompile Include="src\hostgdt.c" />
+    <ClCompile Include="src\win_compat.c" />
+    <ClCompile Include="src\cpuinfo.c" />
+    <ClCompile Include="src\svm.c" />
   </ItemGroup>
   <!-- Assembly Files (MASM x64) -->
   <ItemGroup>
@@ -124,6 +127,7 @@
     <MASM Include="asm\AsmVmexitHandler.asm" />
     <MASM Include="asm\AsmVmxIntrinsics.asm" />
     <MASM Include="asm\AsmHostIdt.asm" />
+    <MASM Include="asm\AsmSvm.asm" />
   </ItemGroup>
   <!-- Header Files -->
   <ItemGroup>
@@ -132,6 +136,10 @@
     <ClInclude Include="include\hv_types.h" />
     <ClInclude Include="include\asm_prototypes.h" />
     <ClInclude Include="include\stealth.h" />
+    <ClInclude Include="include\win_compat.h" />
+    <ClInclude Include="include\cpuinfo.h" />
+    <ClInclude Include="include\svm.h" />
+    <ClInclude Include="include\hv_backend.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

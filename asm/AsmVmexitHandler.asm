@@ -115,6 +115,11 @@ asm_vmexit_handler PROC
 asm_vmexit_handler ENDP
 
 ; vmxoff path -- hypervisor shutting down, restore and return to guest
+;
+; after the pops + add rsp,0120h, rsp == original HOST_RSP, and the vcpu
+; pointer is at [rsp+8] (stored at vmm_stack top-8 by vmx_setup_vmcs).
+; we pass it explicitly to the C helpers — no IA32_TSC_AUX read (that MSR
+; is group-relative and wrong on multi-group machines).
 
 VmxoffPath PROC
 
@@ -139,11 +144,13 @@ VmxoffPath PROC
     ; 0x110 (xmm) + 0x08 (rflags) + 0x08 (padding) = 0x120
     add     rsp, 0120h
 
+    mov     rcx, [rsp+08h]      ; vcpu
     sub     rsp, 020h
     call    vmx_return_rsp_for_vmxoff
     add     rsp, 020h
-    push    rax             ; save guest rsp
+    push    rax                 ; save guest rsp
 
+    mov     rcx, [rsp+010h]     ; vcpu (HOST_RSP is now rsp+8)
     sub     rsp, 020h
     call    vmx_return_rip_for_vmxoff
     add     rsp, 020h

@@ -13,6 +13,10 @@
 #include "hv_types.h"
 #include "asm_prototypes.h"
 #include "stealth.h"
+#include "win_compat.h"
+#include "cpuinfo.h"
+#include "svm.h"
+#include "hv_backend.h"
 
 UINT64 va_to_pa(PVOID va);
 PVOID  pa_to_va(UINT64 pa);
@@ -59,16 +63,26 @@ BOOLEAN vmx_load_vmcs(VIRTUAL_MACHINE_STATE * vcpu);
 UINT32  vmx_adjust_controls(UINT32 requested, UINT32 capability_msr);
 VOID    vmx_set_fixed_bits(VOID);
 VOID    vmx_vmresume(VOID);
-UINT64  vmx_return_rsp_for_vmxoff(VOID);
-UINT64  vmx_return_rip_for_vmxoff(VOID);
+UINT64  vmx_return_rsp_for_vmxoff(VIRTUAL_MACHINE_STATE * vcpu);
+UINT64  vmx_return_rip_for_vmxoff(VIRTUAL_MACHINE_STATE * vcpu);
+
+//
+// AMD SVM backend (svm.c)
+//
+BOOLEAN svm_check_support(VOID);
+BOOLEAN svm_init(VOID);
+VOID    svm_terminate(VOID);
+BOOLEAN svm_virtualize_cpu(PVOID guest_stack);
+VOID    svm_terminate_cpu(VOID);
+VOID    svm_exit_handler(PGUEST_REGS regs, VIRTUAL_MACHINE_STATE * vcpu);
 
 BOOLEAN ept_check_features(VOID);
 BOOLEAN ept_build_mtrr_map(VOID);
 BOOLEAN ept_init(VOID);
-PVMM_EPT_PAGE_TABLE ept_alloc_identity_map(VOID);
+VOID    ept_destroy(VOID);
+UINT64  ept_pml4_pa(VOID);
 UINT8   ept_get_memory_type(SIZE_T pfn, BOOLEAN is_large_page);
 BOOLEAN ept_valid_for_large_page(SIZE_T pfn);
-BOOLEAN ept_setup_pml2(PVMM_EPT_PAGE_TABLE page_table, PEPT_PML2_ENTRY new_entry, SIZE_T pfn);
 
 PEPT_PML1_ENTRY ept_get_pml1(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 PEPT_PML2_ENTRY ept_get_pml2(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
@@ -104,6 +118,8 @@ VOID vmexit_inject_pf(UINT32 error_code, UINT64 fault_addr);
 
 VOID broadcast_virtualize_all(VOID);
 VOID broadcast_terminate_all(VOID);
+
+extern BOOLEAN g_hv_active;     // TRUE once every logical processor is virtualized
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver_obj, PUNICODE_STRING registry_path);
 VOID     DriverUnload(PDRIVER_OBJECT driver_obj);

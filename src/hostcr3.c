@@ -19,7 +19,12 @@
 #define PTE_LARGE_PAGE  (1ULL << 7)
 #define PTE_PFN_MASK    0x000FFFFFFFFFF000ULL
 
-#define MAX_HOST_PT_PAGES 4096
+//
+// deep-copying the kernel half of the system page tables can take many
+// pages on machines with lots of RAM / large kernel VA usage; 16K pages
+// (64MB of page tables) is a generous ceiling for any shipping machine.
+//
+#define MAX_HOST_PT_PAGES 16384
 
 static PVOID   g_host_pt_pages[MAX_HOST_PT_PAGES];
 static UINT32  g_host_pt_count = 0;
@@ -29,7 +34,7 @@ static UINT64  g_host_pml4_pa  = 0;
 static PVOID
 host_alloc_page(VOID)
 {
-    PVOID page = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, HV_POOL_TAG);
+    PVOID page = hv_pool_alloc(PAGE_SIZE);
     if (!page)
         return NULL;
 
@@ -37,6 +42,15 @@ host_alloc_page(VOID)
 
     if (g_host_pt_count < MAX_HOST_PT_PAGES)
         g_host_pt_pages[g_host_pt_count++] = page;
+    else
+    {
+        //
+        // out of tracking slots: leak-safe fallback is to keep the page but
+        // stop tracking (freed at unload by count)... instead fail cleanly.
+        //
+        hv_pool_free(page);
+        return NULL;
+    }
 
     return page;
 }
@@ -259,7 +273,7 @@ hostcr3_destroy(VOID)
     for (UINT32 i = 0; i < g_host_pt_count; i++)
     {
         if (g_host_pt_pages[i])
-            ExFreePoolWithTag(g_host_pt_pages[i], HV_POOL_TAG);
+            hv_pool_free(g_host_pt_pages[i]);
     }
 
     g_host_pt_count = 0;

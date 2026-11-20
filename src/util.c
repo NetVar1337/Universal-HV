@@ -25,27 +25,19 @@ pa_to_va(UINT64 pa)
 }
 
 /*
-*   get the system (kernel) directory table base (cr3 of system process)
-*   we read it from the eprocess of pid 4 (system). this is needed because
-*   when we set host_cr3 in vmcs we need a valid kernel-space cr3 that won't
+*   get a kernel directory table base for VMCS_HOST_CR3.
+*
+*   portable across all Windows versions: on x64 Windows every process's
+*   page tables share the same kernel half (PML4 entries 256-511), so the
+*   current CR3 always maps all kernel addresses correctly. we deliberately
+*   avoid reading EPROCESS!DirectoryTableBase, whose offset has changed
+*   between Windows builds and would break compatibility.
+*
+*   call only at PASSIVE/DPC level (non-root).
 */
 UINT64
 get_system_cr3(VOID)
 {
-
-    // the safest portable way: just read __readcr3() from DPC context
-    // since DPC runs in system process context.
-    // for maximum safety and portability, we use the sytem eprocess cr3:
-    //
-    PEPROCESS sys_proc = PsInitialSystemProcess;
-    if (sys_proc)
-    {
-        return *(UINT64 *)((UINT8 *)sys_proc + 0x28);
-    }
-
-    //
-    // fallback: use current CR3 (may be user-mode process page tables)
-    //
     return __readcr3();
 }
 

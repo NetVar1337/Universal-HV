@@ -11,22 +11,17 @@ EXTERN g_host_nmi_pending:DWORD
 .code _text
 
 
-; NMI handler — sets per-cpu pending flag, vmexit handler injects to guest
+; NMI handler — sets the global pending flag; the next VM-exit handler
+; observes it and injects the NMI into the guest. a single flag is enough
+; because there is exactly one guest OS, and it avoids reading
+; IA32_TSC_AUX (group-relative processor number, ambiguous on multi-group
+; machines).
 
 asm_host_nmi_handler PROC
 
     push    rax
-    push    rcx
-
-    ; get cpu id from IA32_TSC_AUX (no memory access needed)
-    mov     ecx, 0C0000103h
-    rdmsr
-    and     eax, 0FFFh
-
-    lea     rcx, g_host_nmi_pending
-    mov     dword ptr [rcx + rax*4], 1
-
-    pop     rcx
+    mov     eax, 1
+    lock or DWORD PTR g_host_nmi_pending, eax
     pop     rax
     iretq
 

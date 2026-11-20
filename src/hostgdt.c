@@ -10,7 +10,7 @@ hostgdt_build_for_vcpu(VIRTUAL_MACHINE_STATE * vcpu)
     UINT64 orig_base  = asm_get_gdt_base();
     UINT16 orig_limit = asm_get_gdt_limit();
 
-    PVOID gdt_copy = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, HV_POOL_TAG);
+    PVOID gdt_copy = hv_pool_alloc(PAGE_SIZE);
     if (!gdt_copy)
         return FALSE;
 
@@ -30,7 +30,7 @@ hostgdt_destroy_for_vcpu(VIRTUAL_MACHINE_STATE * vcpu)
 {
     if (vcpu->host_gdt)
     {
-        ExFreePoolWithTag(vcpu->host_gdt, HV_POOL_TAG);
+        hv_pool_free(vcpu->host_gdt);
         vcpu->host_gdt = NULL;
     }
 }

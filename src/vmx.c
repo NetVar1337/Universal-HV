@@ -5,40 +5,14 @@
 */
 #include "hv.h"
 
-/*
-*   get current processor id without windows apis
-*   ia32_tsc_aux (0xc0000103) is set by the os to the processor number
-*   safe to call in vmx-root mode. lower 12 bits = processor number
-*/
-static __forceinline UINT32
-vmx_get_cpu_id(VOID)
-{
-    return (UINT32)(__readmsr(IA32_TSC_AUX) & 0xFFF);
-}
-
 BOOLEAN
 vmx_check_support(VOID)
 {
-    CPUID                         data              = {0};
-    IA32_FEATURE_CONTROL_REGISTER feat_ctrl = {0};
-
     //
-    // CPUID.1:ECX[5] = VMX support
+    // vendor + IA32_FEATURE_CONTROL handling already done by
+    // cpuinfo_init()/cpuinfo_vmx_enable() in DriverEntry.
     //
-    __cpuid((int *)&data, 1);
-    if (!_bittest((const LONG *)&data.ecx, CPUID_VMX_BIT))
-    {
-        return FALSE;
-    }
-
-    feat_ctrl.AsUInt = __readmsr(IA32_FEATURE_CONTROL);
-
-    if (feat_ctrl.EnableVmxOutsideSmx == FALSE)
-    {
-        return FALSE;
-    }
-
-    return TRUE;
+    return (g_cpu.vendor == HV_VENDOR_INTEL && g_cpu.vmx_usable) ? TRUE : FALSE;
 }
 
 UINT32
@@ -85,15 +59,12 @@ BOOLEAN
 vmx_alloc_vmxon(VIRTUAL_MACHINE_STATE * vcpu)
 {
     IA32_VMX_BASIC_REGISTER vmx_basic = {0};
-    PHYSICAL_ADDRESS        max_phys;
     UINT8 *                 vmxon_region;
     UINT64                  phys_addr;
     UINT64                  aligned_va;
     UINT64                  aligned_pa;
 
-    max_phys.QuadPart = MAXULONG64;
-
-    vmxon_region = (UINT8 *)MmAllocateContiguousMemory(2 * VMXON_SIZE + ALIGNMENT_PAGE_SIZE, max_phys);
+    vmxon_region = (UINT8 *)hv_alloc_contiguous(2 * VMXON_SIZE + ALIGNMENT_PAGE_SIZE);
     if (!vmxon_region)
         return FALSE;
 
@@ -115,15 +86,12 @@ BOOLEAN
 vmx_alloc_vmcs(VIRTUAL_MACHINE_STATE * vcpu)
 {
     IA32_VMX_BASIC_REGISTER vmx_basic = {0};
-    PHYSICAL_ADDRESS        max_phys;
     UINT8 *                 vmcs_region;
     UINT64                  phys_addr;
     UINT64                  aligned_va;
     UINT64                  aligned_pa;
 
-    max_phys.QuadPart = MAXULONG64;
-
-    vmcs_region = (UINT8 *)MmAllocateContiguousMemory(2 * VMCS_SIZE + ALIGNMENT_PAGE_SIZE, max_phys);
+    vmcs_region = (UINT8 *)hv_alloc_contiguous(2 * VMCS_SIZE + ALIGNMENT_PAGE_SIZE);
     if (!vmcs_region)
         return FALSE;
 
@@ -247,6 +215,13 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
         CPU_BASED_VM_EXEC_CTRL2_ENABLE_XSAVES |
         CPU_BASED_VM_EXEC_CTRL2_ENABLE_USER_WAIT_PAUSE, //  does not gurantee latest versions of windows 11 support yet btw
         IA32_VMX_PROCBASED_CTLS2);
+
+    //
+    // record whether VPID actually got enabled — INVVPID must only be
+    // executed when VPID is on (it #UDs in VMX root otherwise). on CPUs
+    // without VPID the hardware flushes TLBs on CR3 writes by itself.
+    //
+    g_ept->vpid_enabled = !!(sec_proc & CPU_BASED_VM_EXEC_CTRL2_ENABLE_VPID);
 
     __vmx_vmwrite(VMCS_CTRL_SECONDARY_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, sec_proc);
 
@@ -442,11 +417,16 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
 BOOLEAN
 vmx_virtualize_cpu(PVOID guest_stack)
 {
-    ULONG                   core = KeGetCurrentProcessorNumberEx(NULL);
+    //
+    // system-wide logical processor index (dense across all processor
+    // groups, so multi-group machines with >64 logical processors work)
+    //
+    ULONG                   core = hv_current_processor_index();
     VIRTUAL_MACHINE_STATE * vcpu        = &g_vcpu[core];
     UINT64                  error_code   = 0;
 
-    vcpu->core_id = core;
+    vcpu->proc_index = core;
+    vcpu->core_id    = core;
 
     asm_enable_vmx();
     vmx_set_fixed_bits();
@@ -498,10 +478,14 @@ vmx_vmresume(VOID)
 BOOLEAN
 vmx_init(VOID)
 {
-    g_cpu_count = KeQueryActiveProcessorCount(0);
+    //
+    // count logical processors across ALL processor groups
+    //
+    g_cpu_count = hv_total_processor_count();
+    if (!g_cpu_count)
+        return FALSE;
 
-    g_vcpu = (VIRTUAL_MACHINE_STATE *)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED, sizeof(VIRTUAL_MACHINE_STATE) * g_cpu_count, HV_POOL_TAG);
+    g_vcpu = (VIRTUAL_MACHINE_STATE *)hv_pool_alloc(sizeof(VIRTUAL_MACHINE_STATE) * g_cpu_count);
 
     if (!g_vcpu)
         return FALSE;
@@ -533,8 +517,11 @@ vmx_init(VOID)
     {
         VIRTUAL_MACHINE_STATE * vcpu = &g_vcpu[i];
 
-        vcpu->vmm_stack = (UINT64)ExAllocatePool2(
-            POOL_FLAG_NON_PAGED, VMM_STACK_SIZE, HV_POOL_TAG);
+        //
+        // contiguous (page-aligned) so HOST_RSP is guaranteed 16-byte
+        // aligned — the asm exit handler's call alignment depends on it
+        //
+        vcpu->vmm_stack = (UINT64)hv_alloc_contiguous(VMM_STACK_SIZE);
         if (!vcpu->vmm_stack)
             return FALSE;
         RtlZeroMemory((PVOID)vcpu->vmm_stack, VMM_STACK_SIZE);
@@ -542,8 +529,7 @@ vmx_init(VOID)
         //
         // MSR Bitmap (1 page, all zeros = no MSR VM-exits)
         //
-        vcpu->msr_bitmap_va = (UINT64)ExAllocatePool2(
-            POOL_FLAG_NON_PAGED, PAGE_SIZE, HV_POOL_TAG);
+        vcpu->msr_bitmap_va = (UINT64)hv_pool_alloc(PAGE_SIZE);
         if (!vcpu->msr_bitmap_va)
             return FALSE;
         RtlZeroMemory((PVOID)vcpu->msr_bitmap_va, PAGE_SIZE);
@@ -573,8 +559,7 @@ vmx_init(VOID)
         //
         // I/O Bitmap A (ports 0x0000 - 0x7FFF)
         //
-        vcpu->io_bitmap_va_a = (UINT64)ExAllocatePool2(
-            POOL_FLAG_NON_PAGED, PAGE_SIZE, HV_POOL_TAG);
+        vcpu->io_bitmap_va_a = (UINT64)hv_pool_alloc(PAGE_SIZE);
         if (!vcpu->io_bitmap_va_a)
             return FALSE;
         RtlZeroMemory((PVOID)vcpu->io_bitmap_va_a, PAGE_SIZE);
@@ -584,8 +569,7 @@ vmx_init(VOID)
         //
         // I/O Bitmap B (ports 0x8000 - 0xFFFF)
         //
-        vcpu->io_bitmap_va_b = (UINT64)ExAllocatePool2(
-            POOL_FLAG_NON_PAGED, PAGE_SIZE, HV_POOL_TAG);
+        vcpu->io_bitmap_va_b = (UINT64)hv_pool_alloc(PAGE_SIZE);
         if (!vcpu->io_bitmap_va_b)
             return FALSE;
         RtlZeroMemory((PVOID)vcpu->io_bitmap_va_b, PAGE_SIZE);
@@ -663,29 +647,20 @@ vmx_terminate(VOID)
         //
 
         if (vcpu->vmxon_va)
-            MmFreeContiguousMemory((PVOID)vcpu->vmxon_va);
+            hv_free_contiguous((PVOID)vcpu->vmxon_va);
         if (vcpu->vmcs_va)
-            MmFreeContiguousMemory((PVOID)vcpu->vmcs_va);
+            hv_free_contiguous((PVOID)vcpu->vmcs_va);
         if (vcpu->vmm_stack)
-            ExFreePoolWithTag((PVOID)vcpu->vmm_stack, HV_POOL_TAG);
+            hv_free_contiguous((PVOID)vcpu->vmm_stack);
         if (vcpu->msr_bitmap_va)
-            ExFreePoolWithTag((PVOID)vcpu->msr_bitmap_va, HV_POOL_TAG);
+            hv_pool_free((PVOID)vcpu->msr_bitmap_va);
         if (vcpu->io_bitmap_va_a)
-            ExFreePoolWithTag((PVOID)vcpu->io_bitmap_va_a, HV_POOL_TAG);
+            hv_pool_free((PVOID)vcpu->io_bitmap_va_a);
         if (vcpu->io_bitmap_va_b)
-            ExFreePoolWithTag((PVOID)vcpu->io_bitmap_va_b, HV_POOL_TAG);
+            hv_pool_free((PVOID)vcpu->io_bitmap_va_b);
     }
 
-    if (g_ept)
-    {
-        for (UINT32 i = 0; i < g_cpu_count; i++)
-        {
-            if (g_vcpu[i].ept_page_table)
-                MmFreeContiguousMemory(g_vcpu[i].ept_page_table);
-        }
-        ExFreePoolWithTag(g_ept, HV_POOL_TAG);
-        g_ept = NULL;
-    }
+    ept_destroy();
 
 #if USE_PRIVATE_HOST_CR3
     hostcr3_destroy();
@@ -702,8 +677,24 @@ vmx_terminate(VOID)
     }
 #endif
 
-    ExFreePoolWithTag(g_vcpu, HV_POOL_TAG);
+    hv_pool_free(g_vcpu);
     g_vcpu = NULL;
 
     DbgPrintEx(0, 0, "[hv] VMX terminated on all cores.\n");
 }
+
+VOID
+vmx_terminate_cpu(VOID)
+{
+    asm_vmx_vmcall(VMCALL_VMXOFF, 0, 0, 0);
+}
+
+const HV_BACKEND g_vmx_backend = {
+    HV_VENDOR_INTEL,
+    "Intel-VMX",
+    vmx_check_support,
+    vmx_init,
+    vmx_terminate,
+    vmx_virtualize_cpu,
+    vmx_terminate_cpu,
+};

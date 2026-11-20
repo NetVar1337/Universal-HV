@@ -145,19 +145,20 @@ should_generate_df(UINT32 first_vector, UINT32 second_vector)
     return FALSE;
 }
 
+//
+// called from the VmxoffPath asm stub with the vcpu pointer taken from the
+// VMM stack (no IA32_TSC_AUX read — that MSR is group-relative and wrong on
+// multi-group machines).
+//
 UINT64
-vmx_return_rsp_for_vmxoff(VOID)
+vmx_return_rsp_for_vmxoff(VIRTUAL_MACHINE_STATE * vcpu)
 {
-    UINT32                  core_id = (UINT32)(__readmsr(IA32_TSC_AUX) & 0xFFF);
-    VIRTUAL_MACHINE_STATE * vcpu   = &g_vcpu[core_id];
     return vcpu->vmxoff.guest_rsp;
 }
 
 UINT64
-vmx_return_rip_for_vmxoff(VOID)
+vmx_return_rip_for_vmxoff(VIRTUAL_MACHINE_STATE * vcpu)
 {
-    UINT32                  core_id = (UINT32)(__readmsr(IA32_TSC_AUX) & 0xFFF);
-    VIRTUAL_MACHINE_STATE * vcpu   = &g_vcpu[core_id];
     return vcpu->vmxoff.guest_rip;
 }
 
@@ -500,7 +501,12 @@ vmexit_handle_mov_cr(VIRTUAL_MACHINE_STATE * vcpu)
 
             __vmx_vmwrite(VMCS_GUEST_CR3, new_cr3 & ~(1ULL << 63));
 
-            if (!no_flush)
+            //
+            // only flush via INVVPID when VPID is actually enabled —
+            // INVVPID #UDs in VMX root on CPUs/configs without VPID.
+            // without VPID the hardware flushes on the CR3 change itself.
+            //
+            if (!no_flush && g_ept->vpid_enabled && g_ept->invvpid_supported)
             {
                 //
                 // prefer RetainingGlobals (type 3) to preserve global kernel
@@ -938,20 +944,24 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
     case VMX_EXIT_REASON_EXECUTE_INVLPG:
     {
-        // flush combined (EPT+guest) TLB mapping for this linear address
-        INVVPID_DESCRIPTOR desc = {0};
-        desc.Vpid          = VPID_TAG;
-        desc.LinearAddress = vcpu->exit_qual;
+        // flush combined (EPT+guest) TLB mapping for this linear address.
+        // only when VPID is enabled; otherwise the hardware already flushed.
+        if (g_ept->vpid_enabled && g_ept->invvpid_supported)
+        {
+            INVVPID_DESCRIPTOR desc = {0};
+            desc.Vpid          = VPID_TAG;
+            desc.LinearAddress = vcpu->exit_qual;
 
-        if (g_ept->invvpid_individual_addr)
-        {
-            UINT8 ret = asm_invvpid(InvvpidIndividualAddress, &desc);
-            if (ret != 0)
+            if (g_ept->invvpid_individual_addr)
+            {
+                UINT8 ret = asm_invvpid(InvvpidIndividualAddress, &desc);
+                if (ret != 0)
+                    asm_invvpid(InvvpidAllContexts, &desc);
+            }
+            else
+            {
                 asm_invvpid(InvvpidAllContexts, &desc);
-        }
-        else
-        {
-            asm_invvpid(InvvpidAllContexts, &desc);
+            }
         }
         break;
     }
@@ -1427,9 +1437,10 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         }
     }
 
-    // check for NMI that fired while in host mode (via private host IDT)
+    // check for NMI that fired while in host mode (via private host IDT).
+    // single global flag — one guest OS, any vCPU may deliver the NMI.
 #if USE_PRIVATE_HOST_IDT
-    if (!vcpu->vmxoff.executed && _InterlockedExchange(&g_host_nmi_pending[vcpu->core_id], 0))
+    if (!vcpu->vmxoff.executed && _InterlockedExchange(&g_host_nmi_pending, 0))
     {
         if (!vcpu->has_pending_nmi)
         {

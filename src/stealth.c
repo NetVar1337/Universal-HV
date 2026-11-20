@@ -77,7 +77,9 @@ stealth_init_cpuid_cache(VOID)
     // check if the CPU forces RDTSC exiting as a must-be-1 bit.
     // if so, we can't toggle it off dynamically — performance hit is
     // unavoidable but compensation still works via the armed flag.
+    // (Intel VMX MSRs only — skip on AMD, where these MSRs do not exist.)
     //
+    if (g_cpu.vendor == HV_VENDOR_INTEL)
     {
         IA32_VMX_BASIC_REGISTER vmx_basic;
         vmx_basic.AsUInt = __readmsr(IA32_VMX_BASIC);
